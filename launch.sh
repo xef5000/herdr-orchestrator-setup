@@ -126,6 +126,9 @@ shell_at_prompt() {
       and ($p.foreground_processes[0].name | test("^-?(zsh|bash|fish|sh)$"))' >/dev/null 2>&1
 }
 wait_shell() { # wait_shell <pane>
+  # Git Bash / MSYS on native Windows: herdr has no Unix foreground process groups
+  # there, so process-info cannot prove readiness. Give the shell a moment instead.
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) sleep "${SWARM_SHELL_WAIT:-4}"; return 0 ;; esac
   local i stable=0
   for i in $(seq 1 120); do   # up to ~60s
     if shell_at_prompt "$1"; then

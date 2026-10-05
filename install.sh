@@ -1,59 +1,84 @@
 #!/usr/bin/env bash
-# Installs the herdr swarm launcher for the current user.
+# Installs the herdr swarm launcher for the current user (macOS, Linux, WSL, Git Bash).
 #
-#   git clone <repo> ~/.config/herdr/swarm && ~/.config/herdr/swarm/install.sh
+#   git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+#   ~/.config/herdr/swarm/install.sh
 #   (or: unzip it anywhere and run ./install.sh — it copies itself into place)
 #
-# What it does (all idempotent):
+# What it does (all idempotent, safe to re-run after `git pull`):
 #   - copies this folder to ~/.config/herdr/swarm (if not already there)
-#   - adds `alias swarm=...` to ~/.zshrc
-#   - adds a ctrl+shift+s keybinding to ~/.config/herdr/config.toml
-#   - builds ~/Applications/Herdr Swarm.app (macOS only) you can drag to the Dock
+#   - adds `alias swarm=...` to your shell rc
+#   - adds a Ctrl+Shift+S keybinding to ~/.config/herdr/config.toml
 #   - makes sure the herdr <-> pi integration is installed
+#   - macOS: builds ~/Applications/Herdr Swarm.app (drag it to the Dock)
+#   - Linux: adds a "Herdr Swarm" entry to your app launcher
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="$HOME/.config/herdr/swarm"
-CFG="$HOME/.config/herdr/config.toml"
+CFG="${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}"
+OS="$(uname -s)"
+case "$OS" in MINGW*|MSYS*|CYGWIN*) WINDOWS=1 ;; *) WINDOWS=0 ;; esac
 
 # ---- prerequisites ----------------------------------------------------------
-command -v jq  >/dev/null || { echo "✗ jq is required (brew install jq)"; exit 1; }
-command -v pi  >/dev/null || { echo "✗ pi is required on PATH"; exit 1; }
+missing=0
+command -v jq >/dev/null || { echo "✗ jq is required   (mac: brew install jq | ubuntu: sudo apt install jq | windows: winget install jqlang.jq)"; missing=1; }
+command -v pi >/dev/null || { echo "✗ pi is required on PATH  (npm install -g @mariozechner/pi-coding-agent)"; missing=1; }
+[[ $missing -eq 0 ]] || exit 1
+
 HERDR="${HERDR_BIN_PATH:-$(command -v herdr || true)}"
-if [[ -z "$HERDR" ]]; then
-  HERDR="$(ps -axo args= | awk '/herdr server$/ {print $1; exit}')"
+if [[ -z "$HERDR" && $WINDOWS -eq 0 ]]; then
+  HERDR="$(ps -axo args= 2>/dev/null | awk '/herdr server$/ {print $1; exit}')"
 fi
-[[ -n "$HERDR" ]] || echo "⚠ herdr binary not found right now (fine if herdr isn't running yet)"
+[[ -n "$HERDR" ]] || echo "⚠ herdr binary not found right now (ok if herdr isn't installed/running yet; see README)"
 
 # ---- 1. files ----------------------------------------------------------------
 if [[ "$SRC" != "$DEST" ]]; then
-  mkdir -p "$(dirname "$DEST")"
-  rsync -a --exclude .git --exclude '*.log' "$SRC/" "$DEST/"
+  mkdir -p "$DEST"
+  if command -v rsync >/dev/null; then
+    rsync -a --exclude .git --exclude '*.log' "$SRC/" "$DEST/"
+  else
+    cp -R "$SRC/." "$DEST/"; rm -rf "$DEST/.git" "$DEST"/*.log
+  fi
   echo "✓ copied to $DEST"
 fi
 chmod +x "$DEST/launch.sh" "$DEST/install.sh"
 
 # ---- 2. alias ----------------------------------------------------------------
-RC="$HOME/.zshrc"; [[ "${SHELL##*/}" == "bash" ]] && RC="$HOME/.bashrc"
+RC="$HOME/.zshrc"
+case "${SHELL##*/}" in bash) RC="$HOME/.bashrc" ;; esac
+[[ $WINDOWS -eq 1 ]] && RC="$HOME/.bashrc"
 if ! grep -q 'herdr/swarm/launch.sh' "$RC" 2>/dev/null; then
-  printf '\n# herdr swarm: type `swarm` in any herdr pane to open the 5-agent tab\nalias swarm="$HOME/.config/herdr/swarm/launch.sh"\n' >> "$RC"
+  {
+    echo ''
+    echo '# herdr swarm: type `swarm` in any herdr pane to open the 5-agent tab'
+    echo 'alias swarm="$HOME/.config/herdr/swarm/launch.sh"'
+  } >> "$RC"
   echo "✓ added 'swarm' alias to $RC"
 fi
 
 # ---- 3. keybinding -----------------------------------------------------------
+# Native Windows runs key commands through cmd.exe, so wrap the script in bash there.
+if [[ $WINDOWS -eq 1 ]]; then
+  KEYCMD='bash -lc "~/.config/herdr/swarm/launch.sh"'
+else
+  KEYCMD='~/.config/herdr/swarm/launch.sh'
+fi
 mkdir -p "$(dirname "$CFG")"; touch "$CFG"
 if ! grep -q 'herdr/swarm/launch.sh' "$CFG"; then
-  cat >> "$CFG" <<'EOF'
-
-# ---- swarm: 5-pane multi-agent tab (orchestrator/planner/impl1/impl2/reviewer)
-# Hold control(⌃)+shift(⇧) and press S. Runs in a temporary pane so you can see progress/errors.
-[[keys.command]]
-key = "ctrl+shift+s"
-type = "pane"
-command = "~/.config/herdr/swarm/launch.sh"
-EOF
-  echo "✓ added ctrl+shift+s keybinding to $CFG"
-  [[ -n "$HERDR" ]] && "$HERDR" server reload-config >/dev/null 2>&1 && echo "✓ herdr config reloaded" || true
+  {
+    echo ''
+    echo '# ---- swarm: 5-pane multi-agent tab (orchestrator/planner/impl1/impl2/reviewer)'
+    echo '# Hold Ctrl+Shift and press S. Runs in a temporary pane so you can see progress/errors.'
+    echo '[[keys.command]]'
+    echo 'key = "ctrl+shift+s"'
+    echo 'type = "pane"'
+    echo "command = '$KEYCMD'"
+  } >> "$CFG"
+  echo "✓ added Ctrl+Shift+S keybinding to $CFG"
+  if [[ -n "$HERDR" ]]; then
+    "$HERDR" server reload-config >/dev/null 2>&1 && echo "✓ herdr config reloaded" || true
+  fi
 fi
 
 # ---- 4. pi integration -------------------------------------------------------
@@ -61,21 +86,35 @@ if [[ -n "$HERDR" ]]; then
   "$HERDR" integration install pi >/dev/null 2>&1 && echo "✓ herdr pi integration installed" || true
 fi
 
-# ---- 5. Dock app (macOS) -----------------------------------------------------
-if [[ "$(uname)" == "Darwin" ]] && command -v osacompile >/dev/null; then
+# ---- 5. clickable launcher ---------------------------------------------------
+if [[ "$OS" == "Darwin" ]] && command -v osacompile >/dev/null; then
   mkdir -p "$HOME/Applications"
-  osacompile -o "$HOME/Applications/Herdr Swarm.app" >/dev/null <<EOF
-do shell script "export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; '$HOME/.config/herdr/swarm/launch.sh' >> '$HOME/.config/herdr/swarm/launch.log' 2>&1"
-EOF
+  SCRIPT="do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; '$HOME/.config/herdr/swarm/launch.sh' >> '$HOME/.config/herdr/swarm/launch.log' 2>&1\""
+  printf '%s\n' "$SCRIPT" | osacompile -o "$HOME/Applications/Herdr Swarm.app" >/dev/null
   echo "✓ built ~/Applications/Herdr Swarm.app  (drag it to your Dock)"
+elif [[ "$OS" == "Linux" && -z "${WSL_DISTRO_NAME:-}" ]]; then
+  mkdir -p "$HOME/.local/share/applications"
+  {
+    echo '[Desktop Entry]'
+    echo 'Type=Application'
+    echo 'Name=Herdr Swarm'
+    echo 'Comment=Open a 5-agent pi swarm tab in herdr'
+    echo "Exec=bash -lc \"$HOME/.config/herdr/swarm/launch.sh >> $HOME/.config/herdr/swarm/launch.log 2>&1\""
+    echo 'Terminal=false'
+    echo 'Categories=Development;'
+  } > "$HOME/.local/share/applications/herdr-swarm.desktop"
+  echo "✓ added 'Herdr Swarm' to your app launcher"
 fi
 
 cat <<EOF
 
-Done. Three ways to start a swarm:
-  • click  ~/Applications/Herdr Swarm.app   (add it to the Dock)
-  • type   swarm        in any herdr terminal pane (open a new shell first, or: source $RC)
-  • press  ⌃ control + ⇧ shift + S   inside herdr
+Done. Ways to start a swarm:
+  • type   swarm          in any herdr terminal pane (open a new shell first, or: source $RC)
+  • press  Ctrl+Shift+S   inside herdr
+EOF
+[[ "$OS" == "Darwin" ]] && echo "  • click  ~/Applications/Herdr Swarm.app   (add it to the Dock)"
+[[ "$OS" == "Linux" && -z "${WSL_DISTRO_NAME:-}" ]] && echo "  • launch 'Herdr Swarm' from your app menu"
+cat <<EOF
 
 Models per role: edit $DEST/models.conf
 Role prompts:    edit $DEST/roles/*.md
