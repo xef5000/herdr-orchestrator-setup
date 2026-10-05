@@ -4,6 +4,7 @@
 #   swarm [start] [--cwd DIR] [--prefix P] [--goal "..."]   open a tab with an orchestrator agent
 #   swarm spawn <type> [--name N] [--task "..."] [--wait]   (from inside a swarm) add a worker pane
 #   swarm types                                             list agent types (agents/*.md)
+#   swarm args <type>                                       inspect the pi flags for an agent type
 #   swarm ls                                                live agents in the current swarm tab
 #   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
 #   swarm wait <name>... [--timeout MS]                     block until each agent settles; print its output
@@ -14,6 +15,12 @@
 #   description: one line
 #   model: provider/model
 #   thinking: off|minimal|low|medium|high|xhigh|max
+#   use_for: one-line routing hint (defaults to description)
+#   caps: edit,edit-tests,git-write,github or none (default: read-only)
+#   tools: exact comma-separated tool allowlist (orchestrator only)
+#   prompt_mode: replace (orchestrator only; default: append)
+#   context_files: off (orchestrator only; disables project context files)
+#   test_paths: optional JavaScript test-path regex (tester)
 #   ---
 # Env overrides: SWARM_MODEL / SWARM_THINKING apply to every agent started.
 set -euo pipefail
@@ -38,6 +45,16 @@ type_file() { echo "$AGENTS_DIR/$1.md"; }
 fm() { # fm <file> <key>  -> frontmatter value
   awk -v k="$2" 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit}
                  NR>1 && index($0, k":")==1 {sub(/^[^:]*:[ \t]*/,""); print; exit}' "$1"
+}
+norm_list() { tr -d ' \t' <<<"$1" | sed 's/^none$//'; }
+has_cap() { [[ ",$1," == *",$2,"* ]]; }
+scope_label() {
+  local caps="$1" label="read-only"
+  if has_cap "$caps" edit; then label="edits files"
+  elif has_cap "$caps" edit-tests; then label="edits test files only"; fi
+  has_cap "$caps" git-write && label+=" + git write"
+  has_cap "$caps" github && label+=" + GitHub"
+  echo "$label"
 }
 body() { # body <file> -> prompt without frontmatter
   awk 'NR==1 && $0!="---" {p=1} p {print; next} NR>1 && $0=="---" {p=1}' "$1"
@@ -73,21 +90,50 @@ wait_shell() { # wait_shell <pane>
   return 1
 }
 
-# start_pi <type> <name> <pane> <extra-prompt-file>
-start_pi() {
-  local type="$1" name="$2" pane="$3" ctx="$4" f model thinking promptf out attempt
+# build_pi_args <type> <prompt-file> -> global PI_ARGS array
+build_pi_args() {
+  local type="$1" promptf="$2" f model thinking caps tools exclude="subagent"
   f="$(type_file "$type")"
   model="${SWARM_MODEL:-$(fm "$f" model)}"
   thinking="${SWARM_THINKING:-$(fm "$f" thinking)}"
-  promptf="$(mktemp -t swarm-prompt.XXXXXX)"; body "$f" > "$promptf"
-  local args=()
-  [[ -n "$model" ]]    && args+=(--model "$model")
-  [[ -n "$thinking" ]] && args+=(--thinking "$thinking")
+  caps="$(norm_list "$(fm "$f" caps)")"
+  PI_ARGS=()
+  [[ -n "$model" ]] && PI_ARGS+=(--model "$model")
+  [[ -n "$thinking" ]] && PI_ARGS+=(--thinking "$thinking")
+  PI_ARGS+=(--extension "$SWARM_HOME/extensions/swarm-guard.ts")
+  if [[ "$type" == orchestrator ]]; then
+    PI_ARGS+=(--extension "$SWARM_HOME/extensions/swarm-orchestrator.ts")
+    tools="$(norm_list "$(fm "$f" tools)")"
+    [[ -n "$tools" ]] && PI_ARGS+=(--tools "$tools")
+  fi
+  if ! has_cap "$caps" edit && ! has_cap "$caps" edit-tests; then
+    exclude+=",edit,write"
+  fi
+  PI_ARGS+=(--exclude-tools "$exclude")
+  if [[ "$type" == orchestrator && "$(fm "$f" context_files)" == off ]]; then
+    PI_ARGS+=(--no-context-files)
+  fi
+  if [[ "$type" == orchestrator && "$(fm "$f" prompt_mode)" == replace ]]; then
+    PI_ARGS+=(--system-prompt "$promptf")
+  else
+    PI_ARGS+=(--append-system-prompt "$promptf")
+  fi
+  if [[ "$type" != orchestrator && -f "$SWARM_HOME/prompts/worker.md" ]]; then
+    PI_ARGS+=(--append-system-prompt "$SWARM_HOME/prompts/worker.md")
+  fi
+  return 0
+}
+
+# start_pi <type> <name> <pane> <extra-prompt-file>
+start_pi() {
+  local type="$1" name="$2" pane="$3" ctx="$4" promptf out attempt
+  promptf="$(mktemp -t swarm-prompt.XXXXXX)"; body "$(type_file "$type")" > "$promptf"
+  build_pi_args "$type" "$promptf"
   wait_shell "$pane" || echo "  (warning: shell in $pane not confirmed idle, trying anyway)" >&2
   for attempt in 1 2 3 4; do
     if out="$("$H" agent start "$name" --kind pi --pane "$pane" --timeout 60000 -- \
-          ${args[@]+"${args[@]}"} --name "$name" \
-          --append-system-prompt "$promptf" --append-system-prompt "$ctx" 2>&1)"; then
+          ${PI_ARGS[@]+"${PI_ARGS[@]}"} --name "$name" \
+          --append-system-prompt "$ctx" 2>&1)"; then
       return 0
     fi
     if grep -q agent_pane_busy <<<"$out"; then sleep 2; wait_shell "$pane" || true; else break; fi
@@ -97,6 +143,11 @@ start_pi() {
 
 # ==============================================================================
 cmd_start() {
+  local pi_help; pi_help="$(pi --help 2>&1)" || true
+  if ! grep -q -- '--exclude-tools' <<<"$pi_help"; then
+    echo "swarm: pi not found or too old for agent scopes (needs --tools/--exclude-tools); install/update pi" >&2
+    exit 1
+  fi
   local CWD="" PREFIX="" WS="${HERDR_WORKSPACE_ID:-}" GOAL=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -121,6 +172,7 @@ cmd_start() {
   local T TAB PANE
   T="$("$H" tab create --workspace "$WS" --cwd "$CWD" --label "swarm:${PREFIX}${PROJECT}" --focus \
         --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
+        --env "SWARM_ROLE=orchestrator" --env "SWARM_CAPS=none" --env "SWARM_NAME=$ORCH" \
         --env "PATH=$SWARM_HOME:${PATH}")"
   TAB="$(jq -r .result.tab.tab_id <<<"$T")"; PANE="$(jq -r .result.root_pane.pane_id <<<"$T")"
   "$H" pane rename "$PANE" "$ORCH" >/dev/null
@@ -130,14 +182,15 @@ cmd_start() {
     echo; echo "# Swarm context (generated)"; echo
     echo "You are \`$ORCH\`, the orchestrator of the swarm in tab \`$TAB\`, project \`$CWD\`."
     [[ -n "$PREFIX" ]] && echo "Agent names in this swarm are prefixed with \`$PREFIX\` (spawn does this automatically)."
-    echo "The \`swarm\` and \`herdr\` commands are on your PATH."
+    echo "Your only tools are swarm_spawn, swarm_prompt, swarm_wait, swarm_read, swarm_ls, swarm_types, swarm_close. You have no shell, file, web or GitHub access — delegate."
     echo; echo "## Agent types you can spawn"; echo
-    echo "| type | description | model (thinking) |"; echo "|---|---|---|"
-    local t f
+    echo "| type | use for | enforced scope | model (thinking) |"; echo "|---|---|---|---|"
+    local t f use_for
     for t in $(list_types); do
       [[ "$t" == "orchestrator" ]] && continue
       f="$(type_file "$t")"
-      echo "| \`$t\` | $(fm "$f" description) | $(fm "$f" model) ($(fm "$f" thinking)) |"
+      use_for="$(fm "$f" use_for)"; use_for="${use_for:-$(fm "$f" description)}"
+      echo "| \`$t\` | $use_for | $(scope_label "$(norm_list "$(fm "$f" caps)")") | $(fm "$f" model) ($(fm "$f" thinking)) |"
     done
   } > "$ctx"
 
@@ -177,18 +230,33 @@ cmd_spawn() {
   if (( w > h * 2 )); then dir=right; else dir=down; fi
   (( w < 70 && h < 18 )) && echo "  (warning: panes are getting small — consider 'swarm close' on finished agents)" >&2
 
-  local PANE
+  local PANE caps test_paths extra_env=()
+  caps="$(norm_list "$(fm "$(type_file "$TYPE")" caps)")"
+  test_paths="$(fm "$(type_file "$TYPE")" test_paths)"
+  [[ -n "$test_paths" ]] && extra_env+=(--env "SWARM_TEST_PATH_RE=$test_paths")
   PANE="$("$H" pane split --pane "$target" --direction "$dir" --ratio 0.5 --cwd "$PWD" --no-focus \
           --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
+          --env "SWARM_ROLE=$TYPE" --env "SWARM_CAPS=${caps:-none}" \
+          ${extra_env[@]+"${extra_env[@]}"} \
           --env "SWARM_NAME=$NAME" --env "PATH=$SWARM_HOME:${PATH}" | jq -r .result.pane.pane_id)"
   "$H" pane rename "$PANE" "$NAME" >/dev/null
 
   local ctx; ctx="$(mktemp -t swarm-ctx.XXXXXX.md)"
   {
     echo; echo "# Swarm context (generated)"; echo
-    echo "Your agent name is \`$NAME\` (type \`$TYPE\`). The orchestrator is \`$ORCH\`; report to it with:"
-    echo "\`herdr agent prompt $ORCH \"DONE $NAME: ...\"\`  (\`herdr\` is on your PATH)."
+    echo "Your agent name is \`$NAME\` (type \`$TYPE\`). The orchestrator is \`$ORCH\`; report to it with the \`swarm_report\` tool."
     echo "Working directory: \`$PWD\`."
+    echo; echo "## Your enforced scope"; echo
+    if has_cap "$caps" edit; then echo "- edit files: yes"
+    elif has_cap "$caps" edit-tests; then echo "- edit files: test files only"
+    else echo "- edit files: no (read-only)"; fi
+    if has_cap "$caps" git-write; then
+      echo "- git write ops (commit, branch, stash, reset, checkout...): yes"
+    else echo "- git write ops (commit, branch, stash, reset, checkout...): no -> hand off to github"; fi
+    if has_cap "$caps" github; then
+      echo "- GitHub (gh, push/pull/fetch, GitHub API): yes"
+    else echo "- GitHub (gh, push/pull/fetch, GitHub API): no -> hand off to github"; fi
+    echo "- spawning/messaging other agents: no — only the orchestrator"
   } > "$ctx"
 
   start_pi "$TYPE" "$NAME" "$PANE" "$ctx"
@@ -273,6 +341,16 @@ cmd_prompt() {
 }
 
 # ==============================================================================
+cmd_args() {
+  [[ $# -eq 1 ]] || { echo "usage: swarm args <type>" >&2; exit 2; }
+  require_type "$1"
+  local promptf; promptf="$(mktemp -t swarm-prompt.XXXXXX)"
+  body "$(type_file "$1")" > "$promptf"
+  build_pi_args "$1" "$promptf"
+  printf '%s\n' ${PI_ARGS[@]+"${PI_ARGS[@]}"}
+  rm -f -- "$promptf"
+}
+
 cmd_types() {
   printf "%-14s %-44s %s\n" TYPE MODEL DESCRIPTION
   local t f
@@ -303,11 +381,12 @@ case "$sub" in
   start)  cmd_start "$@" ;;
   spawn)  cmd_spawn "$@" ;;
   types)  cmd_types ;;
+  args)   cmd_args "$@" ;;
   ls)     cmd_ls ;;
   wait)   cmd_wait "$@" ;;
   prompt) cmd_prompt "$@" ;;
   close)  cmd_close "$@" ;;
-  -h|--help|help) sed -n '2,19p' "$0" ;;
+  -h|--help|help) sed -n '2,25p' "$0" ;;
   --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
-  *)      echo "unknown command: $sub" >&2; sed -n '2,8p' "$0" >&2; exit 2 ;;
+  *)      echo "unknown command: $sub" >&2; sed -n '2,11p' "$0" >&2; exit 2 ;;
 esac

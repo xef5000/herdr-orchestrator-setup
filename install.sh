@@ -43,6 +43,7 @@ if [[ "$SRC" != "$DEST" ]]; then
   echo "✓ copied to $DEST"
 fi
 chmod +x "$DEST/swarm" "$DEST/install.sh"
+chmod +x "$DEST/herdr"
 
 # ---- 2. alias ----------------------------------------------------------------
 # drop entries from the pre-1.0 layout (launch.sh)
@@ -124,6 +125,5 @@ EOF
 [[ "$OS" == "Linux" && -z "${WSL_DISTRO_NAME:-}" ]] && echo "  • launch 'Herdr Swarm' from your app menu"
 cat <<EOF
 
-Models per role: edit $DEST/models.conf
-Role prompts:    edit $DEST/roles/*.md
+Agent types, models, scopes: edit $DEST/agents/*.md
 EOF

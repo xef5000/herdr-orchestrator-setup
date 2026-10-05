@@ -22,20 +22,56 @@ closes them when they're done. Every worker is a normal interactive pi pane you 
 Defined in [`agents/`](agents) — one Markdown file per type, with model + thinking level in the frontmatter.
 Add a file, and the orchestrator can spawn it; no other change needed.
 
-| type | what it does | default model |
-|---|---|---|
-| `orchestrator` | Coordinates. Spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | claude-sonnet-5-5 · high |
-| `planner` | Read-only. Turns a goal into explicit tasks tagged `[simple]` / `[hard]`. | claude-opus-5-5 · xhigh |
-| `impl` | Cheap & fast implementer for well-specified `[simple]` tasks. | deepseek-v4.1-flash · max |
-| `impl-pro` | Stronger implementer for `[hard]` tasks. | gpt-6.1-sol · medium |
-| `reviewer` | Read-only review; approves or requests changes with file:line findings. | claude-opus-5-5 · high |
-| `debugger` | Reproduces and root-causes failures; minimal fix. | claude-opus-5-5 · high |
-| `tester` | Writes and runs tests. | gpt-6.1-sol · medium |
-| `github` | PRs, issues, CI logs, reviews via `gh`. Never force-pushes or merges unasked. | claude-sonnet-5-5 · medium |
-| `researcher` | Read-only answers about libraries, APIs, docs, the codebase. | claude-sonnet-5-5 · medium |
+| type | what it does | scope (enforced) | default model |
+|---|---|---|---|
+| `orchestrator` | Coordinates. Spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | swarm_* tools only | claude-sonnet-5-5 · medium |
+| `planner` | Read-only. Turns a goal into explicit tasks tagged `[simple]` / `[hard]`. | read-only | claude-opus-5-5 · xhigh |
+| `impl` | Cheap & fast implementer for well-specified `[simple]` tasks. | edit files | deepseek-v4.1-flash · max |
+| `impl-pro` | Stronger implementer for `[hard]` tasks. | edit files | gpt-6.1-sol · medium |
+| `reviewer` | Read-only review; approves or requests changes with file:line findings. | read-only | claude-opus-5-5 · high |
+| `debugger` | Reproduces and root-causes failures; minimal fix. | edit files | claude-opus-5-5 · high |
+| `tester` | Writes and runs tests. | test files only | gpt-6.1-sol · medium |
+| `github` | PRs, issues, CI logs, reviews via `gh`. Never force-pushes or merges unasked. | git write + GitHub, no file edits | claude-sonnet-5-5 · medium |
+| `researcher` | Read-only answers about libraries, APIs, docs, the codebase. | read-only | claude-sonnet-5-5 · medium |
 
 > Model IDs are the ones available in the author's org. Run `pi --list-models` and edit the
 > frontmatter in `agents/*.md` if yours differ.
+>
+> No `caps:` in the frontmatter means **read-only** — a type only gets write access it asks for.
+
+## Scopes & enforcement
+
+Agent scopes are **enforced**, not just prose. The frontmatter of `agents/<type>.md` sets the scope, and the
+`swarm` script turns it into pi flags (`--tools` / `--exclude-tools`), environment (`SWARM_ROLE`, `SWARM_CAPS`)
+and the `extensions/swarm-guard.ts` extension, which checks every tool call against the rules in
+`extensions/swarm-policy.ts`.
+
+Frontmatter keys:
+
+- `use_for:` one-line routing hint shown to the orchestrator in its agent table.
+- `caps:` comma list from `edit`, `edit-tests`, `git-write`, `github` — or `none`. **Missing = none = read-only.**
+- `tools:` exact comma-separated tool allowlist (orchestrator only; the `swarm_*` tools).
+- `prompt_mode: replace` — use the body as the whole system prompt instead of appending it (orchestrator only).
+- `context_files: off` — start without project context files (orchestrator only).
+- `test_paths:` optional JavaScript test-path regex, overriding the guard's default (tester).
+
+What the guard does:
+
+- A tool call outside the role's scope is **blocked** with a reason that names whom to hand the work off to,
+  e.g. `swarm guard: impl may not use GitHub. Hand off: swarm_report HANDOFF 'github should …'`. A blocked
+  worker hands the work off instead of working around it.
+- **Approval dialogs**: force-push, push to `main`/`master`, `gh pr merge`, closing/deleting issues or repos,
+  releases and other mutating `gh api` calls make the worker show as `blocked` and open a dialog **in that
+  worker's pane**. The orchestrator tells you what it asks; you approve or decline there. A declined action is
+  never retried another way.
+- Workers report with the `swarm_report` tool (`DONE` / `QUESTION` / `HANDOFF`). The orchestrator has **only**
+  `swarm_*` tools — no shell, file, web or GitHub access — so everything else is delegated.
+- Inspect the exact pi flags a type gets: `swarm args <type>`.
+- Run the guard/policy tests: `node --test`.
+
+**Limits.** The guard is a guardrail against over-eager models, not a sandbox. It cannot catch
+`find -delete`/`-exec rm`, `python -c`, `node -e`, running scripts, variable-named commands, or GitHub
+access via MCP/codemode tools.
 
 ---
 
@@ -139,7 +175,8 @@ swarm --prefix api-                                # a second swarm (names must 
 SWARM_MODEL=anthropic/claude-sonnet-5-5 swarm      # one model for every agent, this run only
 ```
 
-Commands the orchestrator uses (you can run them too, from a shell inside the swarm tab):
+The orchestrator drives these through its `swarm_*` tools; the same commands still work for you from a shell
+inside the swarm tab:
 
 ```sh
 swarm types                                  # list agent types
@@ -163,6 +200,8 @@ Finished? Close the `swarm:<project>` tab from the sidebar.
 | add an agent type | create `agents/<type>.md` (copy an existing one) |
 | change a model / thinking level | the frontmatter of `agents/<type>.md` |
 | change behaviour | the Markdown body of `agents/<type>.md` |
+| change what an agent may do | `caps:` in `agents/<type>.md` |
+| guard rules | `extensions/swarm-policy.ts` |
 | orchestration strategy | `agents/orchestrator.md` |
 
 Changes apply to the next agent spawned. Re-running `install.sh` after `git pull` is safe (it also
@@ -170,6 +209,8 @@ cleans up entries from older versions).
 
 ## Troubleshooting
 
+- **`Failed to load extension …swarm-guard.ts`** — pi is too old or the file is missing. Run `swarm args <type>`, then start pi with those exact flags to see the error.
+- **`swarm guard: … blocked`** — working as intended. Edit `caps:` in `agents/<type>.md` if the scope is wrong.
 - **`agent_pane_busy` / failed to start** — the new pane's shell wasn't ready; `swarm` retries 4×. Slow shell startup? Just retry.
 - **`agent 'orchestrator' is already live`** — close the existing swarm tab or use `--prefix`.
 - **Dock app does nothing** — herdr must be running; see `~/.config/herdr/swarm/launch.log`.
