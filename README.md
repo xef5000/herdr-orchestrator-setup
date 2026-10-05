@@ -1,24 +1,41 @@
-# herdr orchestrator setup
+# herdr-swarm
 
-One click → a [herdr](https://herdr.dev) tab with **5 [pi](https://github.com/earendil-works/pi-mono) agents working as a team**:
+An **orchestrator-driven agent swarm** for [herdr](https://herdr.dev) + [pi](https://github.com/earendil-works/pi-mono).
+
+One click opens a tab with a single **orchestrator** agent. You tell it what you want. It spawns
+specialised workers into the same tab as it needs them — a planner, cheap or strong implementers, a
+reviewer, a debugger, a GitHub expert… — gives them self-contained tasks, collects their reports, and
+closes them when they're done. Every worker is a normal interactive pi pane you can click into.
 
 ```
-┌──────────────┬──────────────┬──────────────┐
-│ orchestrator │    impl1     │              │
-├──────────────┼──────────────┤   reviewer   │
-│   planner    │    impl2     │              │
-└──────────────┴──────────────┴──────────────┘
+ you ──▶ ┌──────────────┬──────────────┐
+         │ orchestrator │   planner    │      swarm spawn planner   --task "..." --wait
+         │              ├──────────────┤      swarm spawn impl      --task "..."
+         │              │    impl      │      swarm spawn impl-pro  --task "..."
+         ├──────────────┼──────────────┤      swarm spawn reviewer  --task "..." --wait
+         │   impl-pro   │   reviewer   │      swarm close impl
+         └──────────────┴──────────────┘
 ```
 
-| pane | job | default model |
+## Agent types
+
+Defined in [`agents/`](agents) — one Markdown file per type, with model + thinking level in the frontmatter.
+Add a file, and the orchestrator can spawn it; no other change needed.
+
+| type | what it does | default model |
 |---|---|---|
-| **orchestrator** | Coordinates everyone, never edits code. **You talk to this one.** | claude-sonnet-5-5 · high |
-| **planner** | Read-only. Turns your goal into explicit tasks tagged `[simple]` / `[hard]`. | claude-opus-5-5 · xhigh |
-| **impl1** | Cheap & fast implementer for `[simple]` tasks. | deepseek-v4.1-flash · max |
-| **impl2** | Stronger implementer for `[hard]` tasks. | gpt-6.1-sol · medium |
-| **reviewer** | Read-only. Approves or requests changes. | claude-opus-5-5 · high |
+| `orchestrator` | Coordinates. Spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | claude-sonnet-5-5 · high |
+| `planner` | Read-only. Turns a goal into explicit tasks tagged `[simple]` / `[hard]`. | claude-opus-5-5 · xhigh |
+| `impl` | Cheap & fast implementer for well-specified `[simple]` tasks. | deepseek-v4.1-flash · max |
+| `impl-pro` | Stronger implementer for `[hard]` tasks. | gpt-6.1-sol · medium |
+| `reviewer` | Read-only review; approves or requests changes with file:line findings. | claude-opus-5-5 · high |
+| `debugger` | Reproduces and root-causes failures; minimal fix. | claude-opus-5-5 · high |
+| `tester` | Writes and runs tests. | gpt-6.1-sol · medium |
+| `github` | PRs, issues, CI logs, reviews via `gh`. Never force-pushes or merges unasked. | claude-sonnet-5-5 · medium |
+| `researcher` | Read-only answers about libraries, APIs, docs, the codebase. | claude-sonnet-5-5 · medium |
 
-The agents message each other through `herdr agent prompt`. Every pane is a normal interactive pi — click into any of them and chat.
+> Model IDs are the ones available in the author's org. Run `pi --list-models` and edit the
+> frontmatter in `agents/*.md` if yours differ.
 
 ---
 
@@ -27,82 +44,79 @@ The agents message each other through `herdr agent prompt`. Every pane is a norm
 ### Prerequisites (all platforms)
 
 1. **herdr** ≥ 0.9 — <https://herdr.dev/docs/install/>
-2. **pi** on your `PATH` — `npm install -g @mariozechner/pi-coding-agent` (and log in to a provider once by running `pi`)
+2. **pi** on your `PATH` — `npm install -g @mariozechner/pi-coding-agent` (run `pi` once to log in to a provider)
 3. **jq**
 
 ### macOS
 
 ```sh
-brew install herdr jq                    # if you don't have them yet
-git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+brew install herdr jq                    # if needed
+git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
 ~/.config/herdr/swarm/install.sh
 ```
 
 You get:
-- **`~/Applications/Herdr Swarm.app`** → open Finder → your home folder → `Applications`, drag it to the Dock. Click it to start a swarm. *(First click: macOS may ask for permission — allow it.)*
+- **`~/Applications/Herdr Swarm.app`** → Finder → your home folder → `Applications`, drag it to the Dock. Click it to start a swarm. *(First click: allow the macOS permission prompt.)*
 - the `swarm` command in any herdr terminal pane
 - the **⌃ control + ⇧ shift + S** shortcut inside herdr
 
 ### Windows
 
-herdr runs natively on Windows, but this launcher is a bash script. Two options:
+herdr runs natively on Windows, but `swarm` is a bash script. Two options:
 
-#### Option A — WSL2 (recommended, fully supported)
+#### Option A — WSL2 (recommended)
 
-Everything (herdr, pi, this repo) lives inside WSL. This is identical to the Linux setup and is what's been tested.
+Everything (herdr, pi, this repo) lives inside WSL; identical to the Linux setup and the tested path.
 
 ```powershell
-wsl --install -d Ubuntu          # once, then reboot and open "Ubuntu" from the Start menu
+wsl --install -d Ubuntu          # once; reboot; open "Ubuntu" from the Start menu
 ```
 
-Inside the Ubuntu terminal:
+In the Ubuntu terminal:
 
 ```sh
 sudo apt update && sudo apt install -y jq git curl
 curl -fsSL https://herdr.dev/install.sh | sh
-# install node + pi if you don't have them:
+# node + pi, if missing:
 #   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt install -y nodejs
 npm install -g @mariozechner/pi-coding-agent
-git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
 ~/.config/herdr/swarm/install.sh
-herdr                               # start herdr
+herdr
 ```
 
-Start a swarm by typing `swarm` in a herdr pane or pressing **Ctrl+Shift+S**.
-Tip: use [Windows Terminal](https://aka.ms/terminal) with the Ubuntu profile for the best experience.
+Start a swarm with `swarm` in a pane or **Ctrl+Shift+S**. [Windows Terminal](https://aka.ms/terminal) with the Ubuntu profile works best.
 
 #### Option B — native Windows + Git Bash (best-effort)
 
-1. Install herdr natively:
-   ```powershell
-   powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"
-   ```
-2. Install [Git for Windows](https://git-scm.com/download/win) (provides Git Bash), [Node.js](https://nodejs.org), and jq (`winget install jqlang.jq`).
+1. `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"`
+2. Install [Git for Windows](https://git-scm.com/download/win), [Node.js](https://nodejs.org), and jq (`winget install jqlang.jq`).
 3. In **Git Bash**:
    ```sh
    npm install -g @mariozechner/pi-coding-agent
-   git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+   git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
    ~/.config/herdr/swarm/install.sh
    ```
-4. Set herdr to open Git Bash panes, in `%USERPROFILE%\.config\herdr\config.toml`:
+4. Make herdr open Git Bash panes — in `%USERPROFILE%\.config\herdr\config.toml`:
    ```toml
    default_shell = "C:\\Program Files\\Git\\bin\\bash.exe"
    ```
    then `herdr server reload-config`.
 
-Start a swarm with `swarm` in a pane or **Ctrl+Shift+S**. On native Windows herdr can't confirm a pane's shell is idle before launching an agent, so the launcher just waits a few seconds instead (`SWARM_SHELL_WAIT=8 swarm` if your shell starts slowly). If something misbehaves, prefer Option A.
+On native Windows herdr can't confirm a pane's shell is idle, so `swarm` waits a few seconds instead
+(`SWARM_SHELL_WAIT=8` if your shell starts slowly). If anything misbehaves, use Option A.
 
 ### Linux
 
 ```sh
-sudo apt install -y jq            # or your distro's equivalent
+sudo apt install -y jq
 curl -fsSL https://herdr.dev/install.sh | sh
 npm install -g @mariozechner/pi-coding-agent
-git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
 ~/.config/herdr/swarm/install.sh
 ```
 
-You also get a **"Herdr Swarm"** entry in your desktop app launcher.
+Also adds a **"Herdr Swarm"** entry to your desktop app launcher.
 
 ---
 
@@ -112,35 +126,47 @@ Start a swarm with any of:
 
 - 🖱️ click **Herdr Swarm** (Dock on macOS / app menu on Linux)
 - ⌨️ type **`swarm`** in any herdr terminal pane (not inside an agent) and press Enter
-- ⌨️ press **Ctrl+Shift+S** inside herdr (on Mac: ⌃ control + ⇧ shift + S)
+- ⌨️ press **Ctrl+Shift+S** inside herdr (Mac: ⌃ control + ⇧ shift + S)
 
-A new tab named `swarm:<project>` appears, using the project of the pane you had focused. **Click the orchestrator pane (top-left) and describe what you want built.** It plans with the planner, farms work to impl1/impl2, and routes results through the reviewer, then reports back.
+A tab `swarm:<project>` opens with just the orchestrator, in the project of the pane you had focused.
+**Type what you want built.** Watch workers appear as panes beside it; click any of them to see or
+talk to it. When the orchestrator is done it reports back and closes its workers.
 
 ```sh
 swarm --goal "Add CSV export to the orders page"   # hand off a goal immediately
 swarm --cwd ~/src/other-project                    # pick the project explicitly
-swarm --prefix api-                                # a second swarm (agent names must be unique)
-SWARM_MODEL=anthropic/claude-sonnet-5-5 swarm      # one model for every role, this run only
+swarm --prefix api-                                # a second swarm (names must be unique per herdr server)
+SWARM_MODEL=anthropic/claude-sonnet-5-5 swarm      # one model for every agent, this run only
 ```
 
-Finished? Close the `swarm:<project>` tab from the sidebar (right-click → close).
+Commands the orchestrator uses (you can run them too, from a shell inside the swarm tab):
+
+```sh
+swarm types                                  # list agent types
+swarm spawn reviewer --task "..." --wait     # add a worker, send a task, wait for it to settle
+swarm ls                                     # live agents in this tab + state
+swarm close reviewer                         # close a worker's pane
+```
+
+Finished? Close the `swarm:<project>` tab from the sidebar.
 
 ## Customize
 
-| file | what |
+| what | where |
 |---|---|
-| `models.conf` | model + thinking level per role (`<role> <provider/model> <thinking>`) — run `pi --list-models` to see what you have |
-| `roles/*.md` | the system prompt of each role |
-| `launch.sh` | pane layout and wiring |
+| add an agent type | create `agents/<type>.md` (copy an existing one) |
+| change a model / thinking level | the frontmatter of `agents/<type>.md` |
+| change behaviour | the Markdown body of `agents/<type>.md` |
+| orchestration strategy | `agents/orchestrator.md` |
 
-Changes apply to the next swarm you start. Re-running `install.sh` after a `git pull` is safe.
-
-> Model IDs in `models.conf` are the ones available in the author's org. If `pi --list-models` doesn't list them for you, edit that file first.
+Changes apply to the next agent spawned. Re-running `install.sh` after `git pull` is safe (it also
+cleans up entries from older versions).
 
 ## Troubleshooting
 
-- **`agent_pane_busy`** — a pane's shell wasn't ready yet. The launcher retries 4×; if it still fails your shell startup is very slow — run `swarm` again.
-- **`agent 'orchestrator' is already live`** — you already have a swarm; close its tab or use `--prefix`.
-- **Dock app does nothing** — check `~/.config/herdr/swarm/launch.log`. herdr must be running.
-- **Panes don't show agent names** — run `herdr integration install pi` and restart pi.
-- **Keybinding doesn't fire** — some terminals don't report `ctrl+shift+s`; just use `swarm` or the app.
+- **`agent_pane_busy` / failed to start** — the new pane's shell wasn't ready; `swarm` retries 4×. Slow shell startup? Just retry.
+- **`agent 'orchestrator' is already live`** — close the existing swarm tab or use `--prefix`.
+- **Dock app does nothing** — herdr must be running; see `~/.config/herdr/swarm/launch.log`.
+- **Panes don't show agent names** — `herdr integration install pi`, then restart pi.
+- **Keybinding doesn't fire** — some terminals don't report `ctrl+shift+s`; use `swarm` or the app.
+- **Orchestrator says `swarm: command not found`** — it was started by an old version; close the tab and start a new swarm.

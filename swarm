@@ -1,0 +1,240 @@
+#!/usr/bin/env bash
+# swarm — orchestrator-driven agent swarm for herdr + pi
+#
+#   swarm [start] [--cwd DIR] [--prefix P] [--goal "..."]   open a tab with an orchestrator agent
+#   swarm spawn <type> [--name N] [--task "..."] [--wait]   (from inside a swarm) add a worker pane
+#   swarm types                                             list agent types (agents/*.md)
+#   swarm ls                                                live agents in the current swarm tab
+#   swarm close <name>                                      close a worker's pane
+#
+# Agent types live in agents/<type>.md with a frontmatter block:
+#   ---
+#   description: one line
+#   model: provider/model
+#   thinking: off|minimal|low|medium|high|xhigh|max
+#   ---
+# Env overrides: SWARM_MODEL / SWARM_THINKING apply to every agent started.
+set -euo pipefail
+
+SWARM_HOME="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
+AGENTS_DIR="$SWARM_HOME/agents"
+command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+
+# ---- herdr binary matching the running server --------------------------------
+resolve_herdr() {
+  if [[ -n "${HERDR_BIN_PATH:-}" && -x "$HERDR_BIN_PATH" ]]; then echo "$HERDR_BIN_PATH"; return; fi
+  if [[ -n "${HERDR_BIN:-}" && -x "$HERDR_BIN" ]]; then echo "$HERDR_BIN"; return; fi
+  local srv; srv="$(ps -axo args= 2>/dev/null | awk '/herdr server$/ && !/awk/ {print $1; exit}')"
+  if [[ -n "$srv" && -x "$srv" ]]; then echo "$srv"; return; fi
+  if command -v herdr >/dev/null 2>&1; then command -v herdr; return; fi
+  echo "herdr binary not found" >&2; exit 1
+}
+H="$(resolve_herdr)"
+
+# ---- agent type files ----------------------------------------------------------
+type_file() { echo "$AGENTS_DIR/$1.md"; }
+fm() { # fm <file> <key>  -> frontmatter value
+  awk -v k="$2" 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit}
+                 NR>1 && index($0, k":")==1 {sub(/^[^:]*:[ \t]*/,""); print; exit}' "$1"
+}
+body() { # body <file> -> prompt without frontmatter
+  awk 'NR==1 && $0!="---" {p=1} p {print; next} NR>1 && $0=="---" {p=1}' "$1"
+}
+list_types() { for f in "$AGENTS_DIR"/*.md; do basename "$f" .md; done; }
+require_type() {
+  [[ -f "$(type_file "$1")" ]] && return 0
+  echo "unknown agent type '$1'. Available: $(list_types | grep -v '^orchestrator$' | tr '\n' ' ')" >&2; exit 1
+}
+
+# ---- helpers -------------------------------------------------------------------
+live_names() { "$H" agent list | jq -r '.result.agents[]?.name // empty'; }
+unique_name() { # unique_name <base>
+  local base="$1" n=2 names; names="$(live_names)"
+  grep -qx "$base" <<<"$names" || { echo "$base"; return; }
+  while grep -qx "$base-$n" <<<"$names"; do n=$((n+1)); done
+  echo "$base-$n"
+}
+shell_at_prompt() {
+  "$H" pane process-info --pane "$1" 2>/dev/null | jq -e '
+    .result.process_info as $p
+    | ($p.foreground_processes | length) == 1
+      and $p.foreground_processes[0].pid == $p.shell_pid
+      and ($p.foreground_processes[0].name | test("^-?(zsh|bash|fish|sh)$"))' >/dev/null 2>&1
+}
+wait_shell() { # wait_shell <pane>
+  case "$(uname -s 2>/dev/null)" in MINGW*|MSYS*|CYGWIN*) sleep "${SWARM_SHELL_WAIT:-4}"; return 0 ;; esac
+  local i stable=0
+  for i in $(seq 1 120); do
+    if shell_at_prompt "$1"; then stable=$((stable+1)); [[ $stable -ge 2 ]] && return 0; else stable=0; fi
+    sleep 0.5
+  done
+  return 1
+}
+
+# start_pi <type> <name> <pane> <extra-prompt-file>
+start_pi() {
+  local type="$1" name="$2" pane="$3" ctx="$4" f model thinking promptf out attempt
+  f="$(type_file "$type")"
+  model="${SWARM_MODEL:-$(fm "$f" model)}"
+  thinking="${SWARM_THINKING:-$(fm "$f" thinking)}"
+  promptf="$(mktemp -t swarm-prompt.XXXXXX)"; body "$f" > "$promptf"
+  local args=()
+  [[ -n "$model" ]]    && args+=(--model "$model")
+  [[ -n "$thinking" ]] && args+=(--thinking "$thinking")
+  wait_shell "$pane" || echo "  (warning: shell in $pane not confirmed idle, trying anyway)" >&2
+  for attempt in 1 2 3 4; do
+    if out="$("$H" agent start "$name" --kind pi --pane "$pane" --timeout 60000 -- \
+          ${args[@]+"${args[@]}"} --name "$name" \
+          --append-system-prompt "$promptf" --append-system-prompt "$ctx" 2>&1)"; then
+      return 0
+    fi
+    if grep -q agent_pane_busy <<<"$out"; then sleep 2; wait_shell "$pane" || true; else break; fi
+  done
+  echo "✗ failed to start $name in $pane: $out" >&2; return 1
+}
+
+# ==============================================================================
+cmd_start() {
+  local CWD="" PREFIX="" WS="${HERDR_WORKSPACE_ID:-}" GOAL=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --cwd) CWD="$2"; shift 2 ;; --prefix) PREFIX="$2"; shift 2 ;;
+      --workspace) WS="$2"; shift 2 ;; --goal) GOAL="$2"; shift 2 ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$WS" ]] || WS="$("$H" workspace list | jq -r '.result.workspaces[] | select(.focused) | .workspace_id')"
+  [[ -n "$WS" ]] || { echo "could not determine workspace" >&2; exit 1; }
+  if [[ -z "$CWD" ]]; then
+    if [[ "${HERDR_ENV:-}" == "1" ]]; then CWD="$PWD"
+    else CWD="$("$H" pane current 2>/dev/null | jq -r '.result.pane.foreground_cwd // .result.pane.cwd // empty')"; CWD="${CWD:-$HOME}"; fi
+  fi
+  CWD="$(cd "$CWD" && pwd)"
+  local PROJECT ORCH; PROJECT="$(basename "$CWD")"; ORCH="${PREFIX}orchestrator"
+  if grep -qx "$ORCH" <<<"$(live_names)"; then
+    echo "agent '$ORCH' is already live; close that swarm's tab or pass --prefix <p>" >&2; exit 1
+  fi
+
+  echo "▶ creating swarm tab in $WS ($CWD)"
+  local T TAB PANE
+  T="$("$H" tab create --workspace "$WS" --cwd "$CWD" --label "swarm:${PREFIX}${PROJECT}" --focus \
+        --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
+        --env "PATH=$SWARM_HOME:${PATH}")"
+  TAB="$(jq -r .result.tab.tab_id <<<"$T")"; PANE="$(jq -r .result.root_pane.pane_id <<<"$T")"
+  "$H" pane rename "$PANE" "$ORCH" >/dev/null
+
+  local ctx; ctx="$(mktemp -t swarm-ctx.XXXXXX.md)"
+  {
+    echo; echo "# Swarm context (generated)"; echo
+    echo "You are \`$ORCH\`, the orchestrator of the swarm in tab \`$TAB\`, project \`$CWD\`."
+    [[ -n "$PREFIX" ]] && echo "Agent names in this swarm are prefixed with \`$PREFIX\` (spawn does this automatically)."
+    echo "The \`swarm\` and \`herdr\` commands are on your PATH (herdr binary: \`$H\`)."
+    echo; echo "## Agent types you can spawn"; echo
+    echo "| type | description | model (thinking) |"; echo "|---|---|---|"
+    local t f
+    for t in $(list_types); do
+      [[ "$t" == "orchestrator" ]] && continue
+      f="$(type_file "$t")"
+      echo "| \`$t\` | $(fm "$f" description) | $(fm "$f" model) ($(fm "$f" thinking)) |"
+    done
+  } > "$ctx"
+
+  echo "▶ starting pi as '$ORCH' in $PANE"
+  start_pi orchestrator "$ORCH" "$PANE" "$ctx"
+  "$H" agent focus "$ORCH" >/dev/null 2>&1 || true
+  if [[ -n "$GOAL" ]]; then
+    "$H" agent prompt "$ORCH" "$GOAL" >/dev/null; echo "▶ goal handed to $ORCH"
+  else
+    echo "▶ swarm ready in tab $TAB. Type your goal into the '$ORCH' pane."
+  fi
+}
+
+# ==============================================================================
+cmd_spawn() {
+  local TYPE="" NAME="" TASK="" WAIT=0
+  [[ $# -gt 0 && "$1" != --* ]] && { TYPE="$1"; shift; }
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) NAME="$2"; shift 2 ;; --task) TASK="$2"; shift 2 ;; --wait) WAIT=1; shift ;;
+      *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$TYPE" ]] || { echo "usage: swarm spawn <type> [--name N] [--task \"...\"] [--wait]" >&2; exit 2; }
+  require_type "$TYPE"
+  [[ "$TYPE" != "orchestrator" ]] || { echo "use 'swarm start' for an orchestrator" >&2; exit 1; }
+  [[ -n "${HERDR_TAB_ID:-}" ]] || { echo "swarm spawn must run from inside a herdr pane (the orchestrator's)" >&2; exit 1; }
+
+  local PREFIX="${SWARM_PREFIX:-}" ORCH="${SWARM_ORCHESTRATOR:-${SWARM_PREFIX:-}orchestrator}"
+  NAME="${NAME:-$(unique_name "${PREFIX}${TYPE}")}"
+  grep -qx "$NAME" <<<"$(live_names)" && { echo "agent name '$NAME' already live" >&2; exit 1; }
+
+  # pick the largest pane in this tab; split right if wide, else down
+  local L target w h dir
+  L="$("$H" pane layout --pane "$HERDR_PANE_ID" | jq -c '.result.layout.panes | max_by(.rect.width * .rect.height)')"
+  target="$(jq -r .pane_id <<<"$L")"; w="$(jq -r .rect.width <<<"$L")"; h="$(jq -r .rect.height <<<"$L")"
+  if (( w > h * 2 )); then dir=right; else dir=down; fi
+  (( w < 70 && h < 18 )) && echo "  (warning: panes are getting small — consider 'swarm close' on finished agents)" >&2
+
+  local PANE
+  PANE="$("$H" pane split --pane "$target" --direction "$dir" --ratio 0.5 --cwd "$PWD" --no-focus \
+          --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
+          --env "SWARM_NAME=$NAME" --env "PATH=$SWARM_HOME:${PATH}" | jq -r .result.pane.pane_id)"
+  "$H" pane rename "$PANE" "$NAME" >/dev/null
+
+  local ctx; ctx="$(mktemp -t swarm-ctx.XXXXXX.md)"
+  {
+    echo; echo "# Swarm context (generated)"; echo
+    echo "Your agent name is \`$NAME\` (type \`$TYPE\`). The orchestrator is \`$ORCH\`; report to it with:"
+    echo "\`herdr agent prompt $ORCH \"DONE $NAME: ...\"\`  (herdr binary: \`$H\`, on PATH)."
+    echo "Working directory: \`$PWD\`."
+  } > "$ctx"
+
+  start_pi "$TYPE" "$NAME" "$PANE" "$ctx"
+  echo "spawned $NAME ($TYPE) in pane $PANE"
+  if [[ -n "$TASK" ]]; then
+    if (( WAIT )); then
+      "$H" agent prompt "$NAME" "$TASK" --wait --timeout 1800000 | jq -r '"state: \(.result.agent_status // .result.state // "settled")"' 2>/dev/null || true
+      echo "--- output of $NAME ---"; "$H" agent read "$NAME" --source recent-unwrapped --lines 120 2>/dev/null | grep -v '^─*$' || true
+    else
+      "$H" agent prompt "$NAME" "$TASK" >/dev/null; echo "task sent to $NAME"
+    fi
+  fi
+}
+
+# ==============================================================================
+cmd_types() {
+  printf "%-14s %-44s %s\n" TYPE MODEL DESCRIPTION
+  local t f
+  for t in $(list_types); do
+    f="$(type_file "$t")"
+    printf "%-14s %-44s %s\n" "$t" "$(fm "$f" model) ($(fm "$f" thinking))" "$(fm "$f" description)"
+  done
+}
+
+cmd_ls() {
+  local tab="${HERDR_TAB_ID:-}"
+  "$H" agent list | jq -r --arg tab "$tab" '
+    .result.agents[] | select(.name != null) | select($tab == "" or .tab_id == $tab)
+    | "\(.name)\t\(.agent_status)\t\(.pane_id)"' | column -t
+}
+
+cmd_close() {
+  [[ $# -eq 1 ]] || { echo "usage: swarm close <name>" >&2; exit 2; }
+  local pane; pane="$("$H" agent get "$1" | jq -r .result.agent.pane_id)"
+  [[ -n "$pane" && "$pane" != null ]] || { echo "no live agent '$1'" >&2; exit 1; }
+  [[ "$1" == "${SWARM_ORCHESTRATOR:-}" ]] && { echo "refusing to close the orchestrator" >&2; exit 1; }
+  "$H" pane close "$pane" >/dev/null && echo "closed $1 ($pane)"
+}
+
+# ==============================================================================
+sub="${1:-start}"; [[ $# -gt 0 ]] && shift || true
+case "$sub" in
+  start)  cmd_start "$@" ;;
+  spawn)  cmd_spawn "$@" ;;
+  types)  cmd_types ;;
+  ls)     cmd_ls ;;
+  close)  cmd_close "$@" ;;
+  -h|--help|help) sed -n '2,17p' "$0" ;;
+  --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
+  *)      echo "unknown command: $sub" >&2; sed -n '2,8p' "$0" >&2; exit 2 ;;
+esac

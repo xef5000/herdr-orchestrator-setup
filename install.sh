@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Installs the herdr swarm launcher for the current user (macOS, Linux, WSL, Git Bash).
 #
-#   git clone https://github.com/xef5000/herdr-orchestrator-setup ~/.config/herdr/swarm
+#   git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
 #   ~/.config/herdr/swarm/install.sh
 #   (or: unzip it anywhere and run ./install.sh — it copies itself into place)
 #
@@ -42,17 +42,25 @@ if [[ "$SRC" != "$DEST" ]]; then
   fi
   echo "✓ copied to $DEST"
 fi
-chmod +x "$DEST/launch.sh" "$DEST/install.sh"
+chmod +x "$DEST/swarm" "$DEST/install.sh"
 
 # ---- 2. alias ----------------------------------------------------------------
+# drop entries from the pre-1.0 layout (launch.sh)
+for f in "$HOME/.zshrc" "$HOME/.bashrc"; do
+  [[ -f "$f" ]] && grep -q 'herdr/swarm/launch.sh' "$f" || continue
+  perl -0pi -e 's/\n# herdr swarm:[^\n]*\nalias swarm="[^\n]*launch\.sh"\n//g' "$f" && echo "✓ removed old alias from $f"
+done
+if [[ -f "$CFG" ]] && grep -q 'herdr/swarm/launch.sh' "$CFG"; then
+  perl -0pi -e 's/\n# ---- swarm:[^\n]*\n#[^\n]*\n\[\[keys\.command\]\]\nkey = "ctrl\+shift\+s"\ntype = "pane"\ncommand = [^\n]*launch\.sh[^\n]*\n//g' "$CFG" && echo "✓ removed old keybinding from $CFG"
+fi
 RC="$HOME/.zshrc"
 case "${SHELL##*/}" in bash) RC="$HOME/.bashrc" ;; esac
 [[ $WINDOWS -eq 1 ]] && RC="$HOME/.bashrc"
-if ! grep -q 'herdr/swarm/launch.sh' "$RC" 2>/dev/null; then
+if ! grep -q 'herdr/swarm/swarm' "$RC" 2>/dev/null; then
   {
     echo ''
-    echo '# herdr swarm: type `swarm` in any herdr pane to open the 5-agent tab'
-    echo 'alias swarm="$HOME/.config/herdr/swarm/launch.sh"'
+    echo '# herdr swarm: type `swarm` in any herdr pane to open an orchestrator tab'
+    echo 'alias swarm="$HOME/.config/herdr/swarm/swarm"'
   } >> "$RC"
   echo "✓ added 'swarm' alias to $RC"
 fi
@@ -60,15 +68,15 @@ fi
 # ---- 3. keybinding -----------------------------------------------------------
 # Native Windows runs key commands through cmd.exe, so wrap the script in bash there.
 if [[ $WINDOWS -eq 1 ]]; then
-  KEYCMD='bash -lc "~/.config/herdr/swarm/launch.sh"'
+  KEYCMD='bash -lc "~/.config/herdr/swarm/swarm"'
 else
-  KEYCMD='~/.config/herdr/swarm/launch.sh'
+  KEYCMD='~/.config/herdr/swarm/swarm'
 fi
 mkdir -p "$(dirname "$CFG")"; touch "$CFG"
-if ! grep -q 'herdr/swarm/launch.sh' "$CFG"; then
+if ! grep -q 'herdr/swarm/swarm' "$CFG"; then
   {
     echo ''
-    echo '# ---- swarm: 5-pane multi-agent tab (orchestrator/planner/impl1/impl2/reviewer)'
+    echo '# ---- herdr swarm: open an orchestrator tab'
     echo '# Hold Ctrl+Shift and press S. Runs in a temporary pane so you can see progress/errors.'
     echo '[[keys.command]]'
     echo 'key = "ctrl+shift+s"'
@@ -89,7 +97,7 @@ fi
 # ---- 5. clickable launcher ---------------------------------------------------
 if [[ "$OS" == "Darwin" ]] && command -v osacompile >/dev/null; then
   mkdir -p "$HOME/Applications"
-  SCRIPT="do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; '$HOME/.config/herdr/swarm/launch.sh' >> '$HOME/.config/herdr/swarm/launch.log' 2>&1\""
+  SCRIPT="do shell script \"export PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:\$PATH; '$HOME/.config/herdr/swarm/swarm' >> '$HOME/.config/herdr/swarm/launch.log' 2>&1\""
   printf '%s\n' "$SCRIPT" | osacompile -o "$HOME/Applications/Herdr Swarm.app" >/dev/null
   echo "✓ built ~/Applications/Herdr Swarm.app  (drag it to your Dock)"
 elif [[ "$OS" == "Linux" && -z "${WSL_DISTRO_NAME:-}" ]]; then
@@ -99,7 +107,7 @@ elif [[ "$OS" == "Linux" && -z "${WSL_DISTRO_NAME:-}" ]]; then
     echo 'Type=Application'
     echo 'Name=Herdr Swarm'
     echo 'Comment=Open a 5-agent pi swarm tab in herdr'
-    echo "Exec=bash -lc \"$HOME/.config/herdr/swarm/launch.sh >> $HOME/.config/herdr/swarm/launch.log 2>&1\""
+    echo "Exec=bash -lc \"$HOME/.config/herdr/swarm/swarm >> $HOME/.config/herdr/swarm/launch.log 2>&1\""
     echo 'Terminal=false'
     echo 'Categories=Development;'
   } > "$HOME/.local/share/applications/herdr-swarm.desktop"
