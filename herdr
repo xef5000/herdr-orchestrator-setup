@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Shim so `herdr` works inside swarm panes even when the real binary isn't on PATH
+# (e.g. nix-store installs). Prefers the binary of the running server.
+for c in "${HERDR_BIN_PATH:-}" "${HERDR_BIN:-}"; do [[ -n "$c" && -x "$c" ]] && exec "$c" "$@"; done
+srv="$(ps -axo args= 2>/dev/null | awk '/herdr server$/ && !/awk/ {print $1; exit}')"
+[[ -n "$srv" && -x "$srv" ]] && exec "$srv" "$@"
+self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IFS=: read -ra parts <<<"$PATH"
+for d in "${parts[@]}"; do [[ "$d" == "$self" ]] && continue; [[ -x "$d/herdr" ]] && exec "$d/herdr" "$@"; done
+echo "herdr: binary not found" >&2; exit 127

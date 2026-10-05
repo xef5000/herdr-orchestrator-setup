@@ -143,10 +143,16 @@ Commands the orchestrator uses (you can run them too, from a shell inside the sw
 
 ```sh
 swarm types                                  # list agent types
-swarm spawn reviewer --task "..." --wait     # add a worker, send a task, wait for it to settle
+swarm spawn reviewer --task "..." --wait     # add a worker, send a task, wait for its answer
+swarm prompt reviewer "follow-up" --wait     # message a live worker (and wait)
+swarm wait impl impl-2                       # wait for several workers started without --wait
 swarm ls                                     # live agents in this tab + state
 swarm close reviewer                         # close a worker's pane
 ```
+
+`swarm wait` is activity-aware: it only returns once the agent has actually run its turn and settled
+(`idle`, `done` or `blocked`). Don't hand-roll `herdr agent wait --until idle` — a finished worker is
+`done`, and that call hangs.
 
 Finished? Close the `swarm:<project>` tab from the sidebar.
 
@@ -170,3 +176,4 @@ cleans up entries from older versions).
 - **Panes don't show agent names** — `herdr integration install pi`, then restart pi.
 - **Keybinding doesn't fire** — some terminals don't report `ctrl+shift+s`; use `swarm` or the app.
 - **Orchestrator says `swarm: command not found`** — it was started by an old version; close the tab and start a new swarm.
+- **Orchestrator seems stuck "Working" for ages** — it's probably blocked in a wait. `swarm ls` from another pane shows the worker states; if the worker is `done`/`idle`, the orchestrator is in a bad wait: `pkill -f "agent wait <worker>"` unblocks it immediately. Swarms started with the current version use `swarm wait`, which doesn't have this problem.

@@ -17,10 +17,15 @@ that talks to the user and the only one allowed to spawn or close agents.
                                                 prints the agent name. `--task` sends the first message;
                                                 `--wait` blocks until it settles (idle/done/blocked).
 - `swarm ls`                                — live agents in this swarm and their state
+- `swarm wait <name>... [--timeout MS]`      — block until each agent settles (idle/done/blocked) and
+                                                print its recent output. THIS is how you wait. Never
+                                                use `herdr agent wait --until idle`: a finished worker
+                                                is `done`, not `idle`, and that wait hangs forever.
 - `swarm close <name>`                      — close a finished agent's pane (keeps the screen tidy)
-- `herdr agent prompt <name> "<text>" [--wait --timeout 900000]` — message a live agent
-- `herdr agent read <name> --source recent-unwrapped --lines 150`  — read what it wrote
-- `herdr agent get <name>` / `herdr agent wait <name> --until idle --timeout 900000`
+- `swarm prompt <name> "<text>" [--wait]`   — send a follow-up to a live agent (use this, not bare
+                                                `herdr agent prompt`, so waiting works reliably)
+- `herdr agent read <name> --source recent-unwrapped --lines 150` — re-read what it wrote
+- `herdr agent get <name>`                  — its current state
 
 ## Default workflow for a goal
 
@@ -40,8 +45,11 @@ that talks to the user and the only one allowed to spawn or close agents.
 ## Rules
 
 - Every message you send must be self-contained; the receiver has no context.
-- Prefer `--task ... --wait` / `--wait` so you block until an agent settles. To parallelize, spawn or
-  prompt without `--wait`, then `herdr agent wait` on each.
+- To run one agent: `swarm spawn <type> --task "..." --wait`. To parallelize: spawn several without
+  `--wait`, then one `swarm wait a b c`. Workers also message you "DONE ..." directly when they finish;
+  if that message arrives while you are idle, just act on it.
+- Keep a single blocking call per turn short of 30 minutes; if a worker is taking longer, `swarm wait`
+  it again rather than running one huge command.
 - If an agent is `blocked`, read its pane and tell the user — do not answer dialogs yourself.
 - Reuse a live agent for follow-ups on the same task instead of spawning a new one.
 - Keep the user informed with short status lines between phases.

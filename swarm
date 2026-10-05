@@ -5,6 +5,8 @@
 #   swarm spawn <type> [--name N] [--task "..."] [--wait]   (from inside a swarm) add a worker pane
 #   swarm types                                             list agent types (agents/*.md)
 #   swarm ls                                                live agents in the current swarm tab
+#   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
+#   swarm wait <name>... [--timeout MS]                     block until each agent settles; print its output
 #   swarm close <name>                                      close a worker's pane
 #
 # Agent types live in agents/<type>.md with a frontmatter block:
@@ -128,7 +130,7 @@ cmd_start() {
     echo; echo "# Swarm context (generated)"; echo
     echo "You are \`$ORCH\`, the orchestrator of the swarm in tab \`$TAB\`, project \`$CWD\`."
     [[ -n "$PREFIX" ]] && echo "Agent names in this swarm are prefixed with \`$PREFIX\` (spawn does this automatically)."
-    echo "The \`swarm\` and \`herdr\` commands are on your PATH (herdr binary: \`$H\`)."
+    echo "The \`swarm\` and \`herdr\` commands are on your PATH."
     echo; echo "## Agent types you can spawn"; echo
     echo "| type | description | model (thinking) |"; echo "|---|---|---|"
     local t f
@@ -185,20 +187,89 @@ cmd_spawn() {
   {
     echo; echo "# Swarm context (generated)"; echo
     echo "Your agent name is \`$NAME\` (type \`$TYPE\`). The orchestrator is \`$ORCH\`; report to it with:"
-    echo "\`herdr agent prompt $ORCH \"DONE $NAME: ...\"\`  (herdr binary: \`$H\`, on PATH)."
+    echo "\`herdr agent prompt $ORCH \"DONE $NAME: ...\"\`  (\`herdr\` is on your PATH)."
     echo "Working directory: \`$PWD\`."
   } > "$ctx"
 
   start_pi "$TYPE" "$NAME" "$PANE" "$ctx"
   echo "spawned $NAME ($TYPE) in pane $PANE"
   if [[ -n "$TASK" ]]; then
-    if (( WAIT )); then
-      "$H" agent prompt "$NAME" "$TASK" --wait --timeout 1800000 | jq -r '"state: \(.result.agent_status // .result.state // "settled")"' 2>/dev/null || true
-      echo "--- output of $NAME ---"; "$H" agent read "$NAME" --source recent-unwrapped --lines 120 2>/dev/null | grep -v '^─*$' || true
-    else
-      "$H" agent prompt "$NAME" "$TASK" >/dev/null; echo "task sent to $NAME"
-    fi
+    note_prompt "$NAME"
+    "$H" agent prompt "$NAME" "$TASK" >/dev/null; echo "task sent to $NAME"
+    (( WAIT )) && cmd_wait "$NAME"
   fi
+}
+
+# ==============================================================================
+# Waiting. herdr's `agent wait --until idle` is a trap: a finished worker is
+# `done`, and a freshly prompted agent is still `idle` for a few seconds before
+# its turn starts. So we record herdr's state_change_seq when we send a prompt
+# and only accept a settled state after activity (working/blocked seen, or the
+# seq advanced through a turn).
+SEQ_DIR="${TMPDIR:-/tmp}/swarm-seq"; mkdir -p "$SEQ_DIR"
+seq_file() { echo "$SEQ_DIR/${SWARM_ORCHESTRATOR:-orchestrator}.$1"; }
+agent_seq() { "$H" agent get "$1" 2>/dev/null | jq -r '.result.agent.state_change_seq // 0'; }
+note_prompt() { agent_seq "$1" > "$(seq_file "$1")"; }   # call right BEFORE prompting
+
+# wait_settled <name> <seq0> <timeout_ms>  -> 0 settled, 1 gone, 2 timeout
+wait_settled() {
+  local n="$1" seq0="${2:-0}" tmo="$3" start j st seq act=0; start=$(date +%s)
+  while :; do
+    j="$("$H" agent get "$n" 2>/dev/null)" || return 1
+    st="$(jq -r .result.agent.agent_status <<<"$j")"; seq="$(jq -r '.result.agent.state_change_seq // 0' <<<"$j")"
+    case "$st" in
+      working) act=1 ;;
+      blocked) return 0 ;;
+      idle|done) if (( act )) || (( seq - seq0 >= 2 )); then return 0; fi ;;
+    esac
+    (( ( $(date +%s) - start ) * 1000 >= tmo )) && return 2
+    sleep 1
+  done
+}
+
+# swarm wait <name>... [--timeout MS]
+cmd_wait() {
+  local TIMEOUT=1800000 names=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --timeout) TIMEOUT="$2"; shift 2 ;; *) names+=("$1"); shift ;; esac
+  done
+  [[ ${#names[@]} -gt 0 ]] || { echo "usage: swarm wait <name>... [--timeout MS]" >&2; exit 2; }
+  local n st rc=0 seq0 f
+  for n in "${names[@]}"; do
+    f="$(seq_file "$n")"; seq0=0
+    if [[ -f "$f" ]]; then seq0="$(cat "$f")"; else
+      # no prompt recorded through swarm: trust herdr's settled wait
+      "$H" agent wait "$n" --until idle --until done --until blocked --timeout "$TIMEOUT" >/dev/null 2>&1 || { echo "=== $n: wait timed out or agent gone" >&2; rc=1; continue; }
+      seq0=-9
+    fi
+    wait_settled "$n" "$seq0" "$TIMEOUT"; case $? in
+      1) echo "=== $n: agent gone" >&2; rc=1; continue ;;
+      2) echo "=== $n: TIMEOUT after ${TIMEOUT}ms (still $("$H" agent get "$n" | jq -r .result.agent.agent_status))" >&2; rc=1; continue ;;
+    esac
+    rm -f "$f"
+    st="$("$H" agent get "$n" 2>/dev/null | jq -r .result.agent.agent_status)"
+    echo "=== $n: $st"
+    [[ "$st" == blocked ]] && echo "(blocked: it is showing a question/approval UI — read it and tell the user)"
+    "$H" agent read "$n" --source recent-unwrapped --lines 150 2>/dev/null | grep -v '^\s*$' | grep -v '^─*$' || true
+  done
+  return $rc
+}
+
+# swarm prompt <name> "<text>" [--wait] [--timeout MS]
+cmd_prompt() {
+  local NAME="" TEXT="" WAIT=0 TIMEOUT=1800000
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --wait) WAIT=1; shift ;; --timeout) TIMEOUT="$2"; shift 2 ;;
+      *) if [[ -z "$NAME" ]]; then NAME="$1"; elif [[ -z "$TEXT" ]]; then TEXT="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift ;;
+    esac
+  done
+  [[ -n "$NAME" && -n "$TEXT" ]] || { echo 'usage: swarm prompt <name> "<text>" [--wait] [--timeout MS]' >&2; exit 2; }
+  note_prompt "$NAME"
+  "$H" agent prompt "$NAME" "$TEXT" >/dev/null || exit 1
+  echo "prompt sent to $NAME"
+  (( WAIT )) && cmd_wait "$NAME" --timeout "$TIMEOUT"
+  return 0
 }
 
 # ==============================================================================
@@ -233,8 +304,10 @@ case "$sub" in
   spawn)  cmd_spawn "$@" ;;
   types)  cmd_types ;;
   ls)     cmd_ls ;;
+  wait)   cmd_wait "$@" ;;
+  prompt) cmd_prompt "$@" ;;
   close)  cmd_close "$@" ;;
-  -h|--help|help) sed -n '2,17p' "$0" ;;
+  -h|--help|help) sed -n '2,19p' "$0" ;;
   --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
   *)      echo "unknown command: $sub" >&2; sed -n '2,8p' "$0" >&2; exit 2 ;;
 esac
