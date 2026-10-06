@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parsePolicy, decide, splitCommands, type Policy } from "../extensions/swarm-policy.ts";
@@ -41,7 +43,7 @@ test("planner is read-only and hands off restricted operations", () => {
 
 test("implementer can edit but cannot write git or control workers", () => {
   assert.equal(decide("edit", { path: "src/a.ts" }, impl).action, "allow");
-  for (const cmd of ["git log -5", "sed -i s/a/b/ a.ts", 'herdr agent prompt "$SWARM_ORCHESTRATOR" \'DONE impl: x\'', "herdr agent prompt '${SWARM_ORCHESTRATOR}' hi", "herdr agent prompt orchestrator hi"]) command(impl, cmd, "allow");
+  for (const cmd of ["git log -5", "sed -i s/a/b/ a.ts", 'herdr agent prompt "$SWARM_ORCHESTRATOR" \'DONE impl: x\'', "herdr agent prompt '${SWARM_ORCHESTRATOR}' 'DONE impl: hi'", "herdr agent prompt orchestrator 'DONE impl: hi'"]) command(impl, cmd, "allow");
   for (const cmd of ["git commit -m x", "git push", "git checkout -- a.ts", "herdr agent prompt reviewer hi", "herdr pane close p1"]) command(impl, cmd, "block");
 });
 
@@ -208,6 +210,23 @@ test("write scope uses exact files and directory boundaries", () => {
   for (const file of ["src/b.ts", "library/x.ts", "lib/../src/b.ts", "/other/lib/x.ts"]) assert.equal(decide("edit", { path: file }, p).action, "block");
 });
 
+test("existing directories in write scope need no trailing slash", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "swarm-scope-"));
+  try {
+    mkdirSync(path.join(cwd, "lib"));
+    // This temporary project must exercise write scope, not the temp-file exemption.
+    const p = { ...impl, cwd, tmpDirs: [], writeScope: ["lib"] };
+    for (const tool of ["edit", "write"]) {
+      assert.equal(decide(tool, { path: "lib/x.ts" }, p).action, "allow");
+      assert.equal(decide(tool, { path: "libx.ts" }, p).action, "block");
+    }
+    command(p, "touch lib/x.ts", "allow");
+    command(p, "touch libx.ts", "block");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("tokenizer preserves quoted arguments and detects shell expansions", () => {
   assert.deepEqual(splitCommands('echo "hello world" > "my file"; ls'), [
     { tokens: ["echo", "hello world"], redirects: ["my file"] }, { tokens: ["ls"], redirects: [] },
@@ -249,4 +268,167 @@ test("read-only shell mutations may target temp paths but not project files", ()
   command(planner, "go test ./...", "allow");
   command(github, "> /tmp/swarm-output", "allow");
   command(github, "env FOO=bar", "allow");
+});
+
+test("protected swarm state and agent config cannot be written by any worker", () => {
+  for (const [role, caps] of [["impl", "edit"], ["planner", "none"], ["github", "git-write,github"], ["tester", "edit-tests"]]) {
+    const p = policy(role, caps, { SWARM_HOME: "/tmp/swarm-home", SWARM_RUN_DIR: "/tmp/swarm-run", HOME: "/home/worker" });
+    for (const directory of ["/tmp/swarm-home", "/tmp/swarm-run", "/home/worker/.pi/agent", "~/.pi/agent", "$SWARM_RUN_DIR", "${SWARM_RUN_DIR}", "$SWARM_HOME", "${SWARM_HOME}"]) {
+      for (const tool of ["edit", "write"]) {
+        const d = decide(tool, { path: `${directory}/config.json` }, p);
+        assert.equal(d.action, "block");
+        if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
+      }
+      for (const cmd of [`echo x > ${directory}/config.json`, `cp src/a.ts ${directory}/config.json`, `touch ${directory}/config.json`, `sed -i s/a/b/ ${directory}/config.json`, `perl -pi -e 's/a/b/' ${directory}/config.json`]) {
+        const d = command(p, cmd, "block");
+        if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
+      }
+    }
+    command(p, "cp /tmp/swarm-run/config.json /tmp/copy.json", "allow");
+  }
+});
+
+test("policy resolves state directories, filters project ancestors and parses tool allowlist", () => {
+  const p = policy("impl", "edit", { SWARM_RUN_DIR: "../run", SWARM_HOME: "/", HOME: "/project", SWARM_ALLOW_TOOLS: " mcp_write, custom , " });
+  assert.equal(p.runDir, "/run");
+  assert.equal(p.home, "/");
+  assert.deepEqual(p.protectedDirs, ["/run", "/project/.pi/agent"]);
+  assert.deepEqual(p.allowTools, ["mcp_write", "custom"]);
+  const inConfig = parsePolicy({ SWARM_ROLE: "impl", SWARM_CAPS: "edit", HOME: "/home/worker" }, "/home/worker/.pi/agent/project")!;
+  assert.deepEqual(inConfig.protectedDirs, []);
+  assert.equal(decide("write", { path: "file.ts" }, inConfig).action, "allow");
+});
+
+test("default edit scope is the project and temporary paths, including shell writes", () => {
+  for (const file of ["src/a.ts", "/project/a.ts", "/tmp/a.ts"]) {
+    for (const tool of ["edit", "write"]) assert.equal(decide(tool, { path: file }, impl).action, "allow", file);
+    for (const cmd of [`echo x > ${file}`, `cp src/b.ts ${file}`, `touch ${file}`, `sed -i s/a/b/ ${file}`]) command(impl, cmd, "allow");
+  }
+  for (const file of ["/outside/a.ts", "../a.ts", "/project-other/a.ts"]) {
+    for (const tool of ["edit", "write"]) assert.equal(decide(tool, { path: file }, impl).action, "block", file);
+    for (const cmd of [`echo x > ${file}`, `cp src/b.ts ${file}`, `touch ${file}`, `sed -i s/a/b/ ${file}`, `perl -pi -e 's/a/b/' ${file}`]) command(impl, cmd, "block");
+  }
+  const limited = { ...impl, writeScope: ["src/a.ts"] };
+  command(limited, "echo x > src/b.ts", "block");
+  command(limited, "cp src/b.ts src/a.ts", "allow");
+  command(limited, "mv src/b.ts src/a.ts", "block");
+});
+
+test("interpreters cannot conceal git or GitHub writes for any role", () => {
+  for (const p of [impl, planner, tester, github]) {
+    for (const prefix of ["node -e", "node --eval", "node -p", "python -c", "python3.12 -c", "ruby -e", "perl -e", "deno eval", "bun -e"]) {
+      for (const code of ['require("child_process").execSync("git push")', 'system("git commit -m x")', 'system("gh pr create")', 'fetch("https://api.github.com/repos/o/r")']) {
+        const d = command(p, `${prefix} '${code}'`, "block");
+        if (d.action === "block") assert.match(d.reason, /run git directly instead of through an interpreter/);
+      }
+    }
+    command(p, "node -e 'console.log(1)'", "allow");
+    command(p, "python3 -c 'print(1)'", "allow");
+  }
+});
+
+test("publish checks gate only GitHub-capable publishing and retain dangerous-action approval", () => {
+  const stale = { ...github, currentBranch: () => "feature/x", publishCheck: () => ({ ok: false, why: "changed files" }) };
+  const reviewed = { ...stale, publishCheck: () => ({ ok: true, why: "fresh review" }) };
+  for (const cmd of ["git push origin feature/x", "gh pr create --title t", "gh pr ready 12", "gh -R o/r pr create --title t", "gh pr merge 12"]) {
+    const d = command(stale, cmd, "confirm");
+    if (d.action === "confirm") assert.equal(d.reason, (cmd.includes("merge") ? "gh pr merge changes GitHub state; only the USER may approve this action; " : "") + "unreviewed or stale review: changed files");
+    command(reviewed, cmd, cmd.includes("merge") ? "confirm" : "allow");
+    for (const p of [planner, impl, tester, policy("git", "git-write")]) command({ ...p, publishCheck: stale.publishCheck }, cmd, "block");
+  }
+  command(reviewed, "git push --force origin feature/x", "confirm");
+  command(stale, "git commit -m x", "allow");
+  command(stale, "gh pr view 12", "allow");
+  command({ ...github, currentBranch: () => "feature/x" }, "git push origin feature/x", "allow");
+});
+
+test("hub publishing requires fresh review and dangerous operations always confirm", () => {
+  const stale = { ...github, currentBranch: () => "feature/x", publishCheck: () => ({ ok: false, why: "changed files" }) };
+  const reviewed = { ...stale, publishCheck: () => ({ ok: true, why: "fresh review" }) };
+  for (const cmd of ["hub pull-request", "hub push", "hub -C /project pull-request", "hub -C /project push"]) {
+    const d = command(stale, cmd, "confirm");
+    if (d.action === "confirm") assert.match(d.reason, /unreviewed or stale review: changed files/);
+    command(reviewed, cmd, "allow");
+    command(impl, cmd, "block");
+  }
+  for (const p of [stale, reviewed]) {
+    for (const cmd of ["hub merge https://github.com/o/r/pull/1", "hub push --force", "hub -C /project merge https://github.com/o/r/pull/1", "hub -C /project push --force", "hub pr close 12"]) command(p, cmd, "confirm");
+  }
+  command(reviewed, "hub push origin main", "confirm");
+  command({ ...reviewed, currentBranch: () => "main" }, "hub push", "confirm");
+});
+
+test("non-built-in tools require a capability, read-only metadata or explicit allowlist", () => {
+  for (const p of [impl, tester, github, policy("git", "git-write")]) {
+    assert.equal(decide("mcp_write", {}, p).action, "block");
+    assert.equal(decide("mcp_write", {}, { ...p, allowTools: ["mcp_write"] }).action, "allow");
+    assert.equal(decide("mcp_read", {}, { ...p, toolInfo: () => ({ readOnly: true }) }).action, "allow");
+    assert.equal(decide("mcp_write", {}, { ...p, toolInfo: () => ({ readOnly: false }) }).action, "block");
+    assert.equal(decide("mcp_unknown", {}, { ...p, toolInfo: () => undefined }).action, "block");
+    for (const name of ["read", "grep", "find", "ls", "swarm_report", "codemode"]) assert.equal(decide(name, {}, p).action, "allow");
+  }
+  assert.equal(decide("mcp_write", {}, planner).action, "allow");
+  for (const p of [impl, tester, planner]) {
+    assert.equal(decide("mcp_GitHub_write", {}, { ...p, allowTools: ["mcp_GitHub_write"], toolInfo: () => ({ readOnly: true }) }).action, "block");
+  }
+  assert.equal(decide("mcp_github_write", {}, github).action, "allow");
+});
+
+test("herdr orchestrator prompts carry reports, not arbitrary commands", () => {
+  for (const cmd of ["herdr agent prompt orchestrator '/workflow off'", "herdr agent prompt orchestrator hi", "herdr agent prompt orchestrator", "herdr agent prompt orchestrator 'DONE'"]) command(impl, cmd, "block");
+  for (const kind of ["DONE", "QUESTION", "HANDOFF"]) command(impl, `herdr agent prompt orchestrator '${kind} impl: report'`, "allow");
+});
+
+test("redirect scope honors same-command mktemp variables and output devices", () => {
+  for (const base of [impl, tester, planner, github]) {
+    for (const p of [base, { ...base, writeScope: ["tests/a.test.ts"] }]) {
+      command(p, 'out=$(mktemp); npm test > "$out" 2>&1', "allow");
+      command(p, 'out=$(mktemp); npm test > "${out}" 2>&1', "allow");
+      command(p, 'out=$(mktemp); out=/outside/log; npm test > "$out"', "block");
+      command(p, 'npm test > "$out"', "block");
+      for (const device of ["/dev/tty", "/dev/stderr", "/dev/stdout", "/dev/null", "/dev/fd/1", "/dev/fd/9"]) command(p, `npm test > ${device}`, "allow");
+    }
+  }
+});
+
+test("explicit write scopes still permit temporary files but never protected state", () => {
+  for (const base of [impl, tester]) {
+    const p = { ...base, writeScope: ["tests/a.test.ts"] };
+    command(p, "npm test > /tmp/log", "allow");
+    command(p, "mkdir -p /tmp/x", "allow");
+    for (const tool of ["edit", "write"]) assert.equal(decide(tool, { path: "/tmp/log" }, p).action, "allow");
+    command(p, "npm test > /outside/log", "block");
+    command(p, "mkdir -p /outside/x", "block");
+    const protectedPolicy = { ...p, protectedDirs: ["/tmp/state"] };
+    command(protectedPolicy, "npm test > /tmp/state/log", "block");
+    command(protectedPolicy, "mkdir -p /tmp/state/x", "block");
+    assert.equal(decide("write", { path: "/tmp/state/log" }, protectedPolicy).action, "block");
+  }
+});
+
+test("publish confirmations preserve danger before a failing review reason", () => {
+  const p = { ...github, publishCheck: () => ({ ok: false, why: "stale tree" }) };
+  const d = command(p, "git push --force origin main", "confirm");
+  if (d.action === "confirm") assert.equal(d.reason, "force/delete push changes remote history; only the USER may approve this action; unreviewed or stale review: stale tree");
+});
+
+test("inline interpreter code cannot access swarm state or protected config", () => {
+  for (const [role, caps] of [["impl", "edit"], ["tester", "edit-tests"], ["planner", "none"], ["github", "git-write,github"]]) {
+    const p = policy(role, caps, { SWARM_RUN_DIR: "/tmp/swarm-run", SWARM_HOME: "/tmp/swarm-home", HOME: "/home/worker" });
+    for (const prefix of ["node -e", "node --eval", "node --eval=", "node -p", "python3 -c", "ruby -e", "perl -e", "deno eval", "bun -e"]) {
+      for (const code of ["process.env.SWARM_RUN_DIR", "process.env.SWARM_HOME", 'open("/tmp/swarm-run/state.json", "w")', 'open("/tmp/swarm-home/config", "w")', 'open("/home/worker/.pi/agent/config", "w")']) {
+        const d = command(p, `${prefix}${prefix.endsWith("=") ? "" : " "}'${code}'`, "block");
+        if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
+      }
+    }
+    for (const cmd of [
+      `node -e "fs.writeFileSync('~/.pi/agent/x','')"`,
+      `python3 -c 'open("$HOME/.pi/agent/x","w")'`,
+      `python3 -c 'open("\${HOME}/.pi/agent/x","w")'`,
+    ]) {
+      const d = command(p, cmd, "block");
+      if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
+    }
+    command(p, "node -e 'console.log(1)'", "allow");
+  }
 });

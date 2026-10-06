@@ -20,11 +20,13 @@ closes them when they're done. Every worker is a normal interactive pi pane you 
 ## Agent types
 
 Defined in [`agents/`](agents) — one Markdown file per type, with model + thinking level in the frontmatter.
-Add a file, and the orchestrator can spawn it; no other change needed.
+Add a file, and the orchestrator can spawn it; no other change needed. Agent types are loaded when the
+swarm starts and cached by the orchestrator, so a type added mid-run is picked up when it is first
+requested (a missing type triggers a refresh).
 
 | type | what it does | scope (enforced) | default model |
 |---|---|---|---|
-| `orchestrator` | Coordinates. Spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | swarm_* tools only | claude-sonnet-5-5 · medium |
+| `orchestrator` | Coordinates. Plans, spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | swarm_plan + swarm_* tools | claude-sonnet-5-5 · medium |
 | `planner` | Read-only. Turns a goal into explicit tasks tagged `[simple]` / `[hard]`. | read-only | claude-opus-5-5 · xhigh |
 | `impl` | Cheap & fast implementer for well-specified `[simple]` tasks. | edit files | deepseek-v4.1-flash · max |
 | `impl-pro` | Stronger implementer for `[hard]` tasks. | edit files | gpt-6.1-sol · medium |
@@ -72,6 +74,82 @@ What the guard does:
 **Limits.** The guard is a guardrail against over-eager models, not a sandbox. It cannot catch
 `find -delete`/`-exec rm`, `python -c`, `node -e`, running scripts, variable-named commands, or GitHub
 access via MCP/codemode tools.
+
+---
+
+## Invariants & threat model
+
+These hold no matter what the user, the orchestrator or a worker says. They are what makes a "done"
+from the swarm trustworthy.
+
+**Verdicts are authentic.** `pass`/`fail` verdicts come *only* from the `reviewer` and `tester` agents,
+and only through the `verdict` field of `swarm_report`. A verdict counts only on a `DONE` report; a
+`pass`/`fail` attached to a `QUESTION` or `HANDOFF` is not review evidence, and a report without a
+verdict from those two types is not a review. The `verdict: required` frontmatter on those agents makes
+`swarm_report` refuse their `DONE` without one, and `impl*` reports are never accepted as review
+evidence even if named in `SWARM_PUBLISH_REQUIRE`.
+
+**Publish gate.** Pushing to the hub — `git push`, `gh pr create`/`ready`/`merge` by the `github` role
+— asks the user to confirm **only when evidence is missing or stale**: no fresh `reviewer` (or other
+required role) `DONE` with `verdict: "pass"` whose recorded tree fingerprint equals the current working
+tree. A fresh pass goes straight through; dangerous-action confirms (force-push, push to
+`main`/`master`, …) still apply even then. The fingerprint is `git add -A` + `write-tree` over the
+**working tree**, not the ref being pushed: a push of another branch or a partial commit is not
+distinguished, so the gate is a reminder, not a proof. Any file changed after a review makes that review
+stale; a `tester` that changes the tree during its turn records `tree=null` — re-run it on the final
+tree to satisfy `require: tester`.
+
+**Protected directories.** Only three paths are protected from every worker, whatever its `caps:` —
+`SWARM_HOME` (this repo), `SWARM_RUN_DIR` (the run's state dir) and `~/.pi/agent` (pi config) — and each
+is dropped if the project directory lies inside it. `edit`/`write` and shell writes to them are blocked
+with a reason telling you to report through `swarm_report` instead. `.git/`, `.github/`, `node_modules/`
+and `.env` are **not** specially protected; they are only covered by the normal write scope and
+capability rules.
+
+**Write scope.** By default a write-capable worker may edit the project working tree and temp
+directories, and nothing else. Narrow it with `SWARM_WRITE_SCOPE` (comma-separated files/directories,
+no trailing slash needed on directories) or `swarm spawn <type> --scope "a,b"`; the orchestrator passes
+the same scope through its `swarm_spawn` `files` parameter. Paths outside the scope are blocked with a
+reason, not silently ignored. `cd` is not tracked — paths resolve against the pane's start dir.
+
+**MCP tool policy.** Read-only roles (`caps: none`) may call any MCP tool. Roles with `edit`, `git-write`
+or `github` caps may only call non-built-in tools that are explicitly read-only (the `readOnlyHint`
+annotation) or listed in the agent's `allow_tools:` frontmatter (a comma list, passed to the worker as
+`SWARM_ALLOW_TOOLS`). `codemode` is always allowed. Any tool whose name contains `github` needs the
+`github` cap, **even for read-only roles**. A non-annotated extension tool (e.g. a web search) is
+blocked for an edit/git/github role until you list it in `allow_tools:`.
+
+**Orchestrator messages.** A worker's `herdr agent prompt` to the orchestrator must start with `DONE`,
+`QUESTION` or `HANDOFF` (`KIND name [r:ID verdict:V]: message`), so the orchestrator's inbox stays
+parseable. Reports are delivered **once**: one already returned by `swarm_wait` is deduped from the
+inbox, and one that arrived while the orchestrator was in an approval dialog or otherwise busy is
+recorded as `undelivered` and replayed automatically on a later turn (the hidden state lists what is
+pending).
+
+**State directory.** Run state lives under
+`${SWARM_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/herdr-swarm}/runs/…` — one directory per run,
+holding `events.jsonl` and `artifacts/` — and runs older than 14 days are pruned when a swarm starts. It
+is state, not project data — never commit it.
+
+**No limits.** There are **no** limits on the number of workers, rounds or spawns. The orchestrator may
+spawn as many workers as a task needs and may replace a worker rather than reuse it.
+
+### Threat model
+
+The guards are a guardrail against **over-eager models**, not a sandbox against **adversaries**. They
+stop an agent that is trying to do the right thing but reaches for the wrong tool; they do not stop an
+agent that is actively trying to escape. Known limits, by design:
+
+- Anything a worker hides inside a script it writes and runs — `npm run`/`make` targets, test/build
+  hooks, a downloaded binary — is opaque to the guard.
+- The shell scanner refuses constructs it cannot parse rather than guessing, but a determined agent can
+  still smuggle work through a file, an environment variable or a subprocess.
+- MCP/codemode servers run outside the shell guard; the MCP tool policy above is a routing rule, not a
+  sandbox.
+- The publish fingerprint covers the whole working tree, not the exact ref being pushed, so it can be
+  fresh-but-partial; it is a reminder, not a proof.
+
+Treat the working tree and the machine as trusted. If they are not, run the swarm in a container or VM.
 
 ---
 
@@ -183,15 +261,72 @@ swarm types                                  # list agent types
 swarm spawn reviewer --task "..." --wait     # add a worker, send a task, wait for its answer
 swarm prompt reviewer "follow-up" --wait     # message a live worker (and wait)
 swarm wait impl impl-2                       # wait for several workers started without --wait
+swarm wait impl --no-read                    # report only; skip the pane fallback
 swarm ls                                     # live agents in this tab + state
 swarm close reviewer                         # close a worker's pane
 ```
 
 `swarm wait` is activity-aware: it only returns once the agent has actually run its turn and settled
-(`idle`, `done` or `blocked`). Don't hand-roll `herdr agent wait --until idle` — a finished worker is
-`done`, and that call hangs.
+(`idle`, `done` or `blocked`). It prints the worker's latest report — header `KIND name [r:ID verdict:V]:`
+— and inlines the artifact when it is ≤ 8000 bytes, otherwise printing the artifact path plus
+`swarm_read {report:"r:ID"}` / `context_from:["r:ID"]` pointers. It reads the pane only when there is
+no report since the prompt, or the worker is `blocked`; `--no-read` suppresses that fallback. Don't
+hand-roll `herdr agent wait --until idle` — a finished worker is `done`, and that call hangs.
 
 Finished? Close the `swarm:<project>` tab from the sidebar.
+
+## Plans, epochs & state
+
+Edit-capable work goes through `swarm_plan` before any worker is spawned. A plan is
+`{goal, template, stages:[{id, loop?, steps:[{id, type, brief, files?}]}], require?, max_rounds?, publish?, suggestions?}`;
+`max_rounds` is advisory text only, never a scheduling limit. Built-in templates (all adapt freely):
+
+| template | skeleton |
+|---|---|
+| `small-change` | `ctx(researcher) → ⟳[impl → review]` |
+| `feature` | `plan → ⟳[impl-a ∥ impl-b → review] → test` |
+| `bug` | `debug → repro(tester) → ⟳[fix → review]` |
+| `ci-fix` | `ci(github) → debug → ⟳[fix → review] → push(github)` |
+| `custom` | compose stages/steps yourself |
+
+Plans are tiered by blast radius:
+
+- **Tier 0 — read-only** (any plan with no edit-capable step and nothing that publishes, e.g. `planner`,
+  `researcher`, `reviewer` — `github` publishes and `debugger` edits, so neither is Tier 0): proposed and
+  run without a dialog.
+- **Tier 1 — small** (one maker, no publish): no dialog; the plan is shown as a notify + widget.
+- **Tier 2 — bigger** (a stage with ≥ 2 makers, ≥ 3 makers in total, or any plan that publishes
+  via a `github`-capable step or `publish: true`):
+  requires a fresh `planner`/`researcher` `DONE` report from this epoch, then shows **one** dialog:
+  `Run this plan` / up to 3 lint+suggestion choices / `Change…` / `Wrong — I'll describe the workflow`.
+  Non-publish plans auto-run after 90 s; publish plans never do.
+
+`swarm_plan` actions are `propose`, `amend` and `status`. **Tightening** auto-applies with a notify —
+adding stages, steps or `require` roles, narrowing a step's `files`, and other changes that don't loosen
+safeguards. Anything that **loosens** asks the user first: widening a step's `files`, removing a
+`require` role, a checker or a loop, or newly publishing (a `github` step or `publish: true`); so does
+moving a plan into Tier 2, and changing a Tier-2 plan's goal or maker steps re-asks. On an unapproved or
+`NOT APPROVED` dialog, revise the plan and propose again — never spawn a maker against an unapproved
+plan. An approved plan's `require` is written to `$SWARM_RUN_DIR/policy.json` and is **additive** to the
+default `reviewer` publish gate.
+
+**Spawns and prompts.** Spawning an edit-capable worker needs an approved plan for the current goal;
+when its plan step defines `files`, the spawn's `files` may only narrow them. Prompting an edit-capable
+worker likewise needs an approved plan in the current goal epoch — a worker spawned in an earlier goal
+must be re-spawned there, not prompted. A plan publishes when it has a `github`-capable step (or
+`publish: true`); publish plans are always Tier 2 and never auto-run.
+A `github`-capable worker without edit capabilities can still be spawned without a plan;
+the guard's publish gate, not the spawn plan check, enforces publication safeguards.
+
+Plans render as e.g. `plan → ⟳[impl-a ∥ impl-b → review] → pr(github) 🔒reviewer`.
+
+**Epochs.** A new user message starts a new *goal epoch* when the current one has no spawns yet or its
+plan is done; `/swarm-goal` forces one. Tier 2 approval looks for a planner/researcher report *within
+the current epoch*.
+
+**Hidden state.** A short `[swarm state …]` message is refreshed each prompt and never shown to you:
+goal, plan/step states, live workers, gate freshness (`fresh`/`stale`/`missing`/`fail`) and a next hint.
+It is context, not a report — don't quote it.
 
 ## Customize
 

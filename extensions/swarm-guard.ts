@@ -1,7 +1,12 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { execFile, execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { parsePolicy, decide } from "./swarm-policy.ts";
+import { parseEvents, publishRoles, publishStatus, reportEvent, treeFingerprint } from "./swarm-run.ts";
 
 export default function (pi: ExtensionAPI) {
   const policy = parsePolicy(process.env, process.cwd());
@@ -13,6 +18,34 @@ export default function (pi: ExtensionAPI) {
       }).trim();
     } catch { return undefined; }
   };
+
+  if (policy.runDir) {
+    policy.publishCheck = () => {
+      let jsonl = "";
+      try { jsonl = readFileSync(join(policy.runDir!, "events.jsonl"), "utf8"); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          return { ok: false, why: `Cannot read publish evidence: ${String(error)}` };
+        }
+      }
+      // Re-read the policy on every check so amendments apply to subsequent reports.
+      let policyJson: string | undefined;
+      try { policyJson = readFileSync(join(policy.runDir!, "policy.json"), "utf8"); }
+      catch { /* Missing or unreadable policy adds no required roles. */ }
+      const roles = publishRoles(process.env.SWARM_PUBLISH_REQUIRE, policyJson);
+      return publishStatus(parseEvents(jsonl), roles, treeFingerprint(policy.cwd));
+    };
+  }
+  policy.toolInfo = name => {
+    const tool = pi.getAllTools().find(tool => tool.name === name);
+    return tool ? { readOnly: tool.annotations?.readOnlyHint } : undefined;
+  };
+
+  const verdictRequired = process.env.SWARM_VERDICT === "required";
+  let startTree: string | undefined;
+  if (verdictRequired) {
+    pi.on("before_agent_start", () => { startTree = treeFingerprint(policy.cwd); });
+  }
 
   pi.on("tool_call", async (event, ctx) => {
     const decision = decide(event.toolName, event.input, policy);
@@ -39,20 +72,66 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({
       kind: Type.Union([Type.Literal("DONE"), Type.Literal("QUESTION"), Type.Literal("HANDOFF")]),
       message: Type.String({ description: "Self-contained summary, question or hand-off request" }),
+      verdict: Type.Optional(Type.Union([Type.Literal("pass"), Type.Literal("fail")], { description: "Required on DONE for verdict roles" })),
     }),
     async execute(_toolCallId, params, signal) {
-      const text = `${params.kind} ${policy.name}: ${params.message}`;
+      if (verdictRequired && params.kind === "DONE" && !params.verdict) {
+        throw new Error(`DONE from ${policy.role} must include verdict "pass" or "fail"`);
+      }
       if (!process.env.SWARM_HOME) throw new Error("SWARM_HOME is required to report to the orchestrator");
-      await new Promise<void>((resolve, reject) => {
-        execFile(`${process.env.SWARM_HOME}/herdr`, ["agent", "prompt", orch, text], {
-          cwd: policy.cwd, env: process.env, signal,
-        }, (error, _stdout, stderr) => {
-          if (error) reject(new Error(`swarm_report failed: ${stderr || error.message}`));
-          else resolve();
-        });
-      });
+      const verdict = verdictRequired && params.kind === "DONE" ? params.verdict : undefined;
+      const warnings: string[] = [];
+      const fileError = (error: unknown) => { warnings.push(`Report recording error: ${String(error)}`); };
+      let id: string | undefined;
+      if (policy.runDir) {
+        id = `${Date.now()}-${policy.name}-${randomBytes(3).toString("hex")}`;
+        const currentTree = treeFingerprint(policy.cwd);
+        // Writing tests or producing untracked, non-ignored review files changes the tree;
+        // such verdicts get tree=null and require a fresh review of the resulting tree.
+        const tree = currentTree && currentTree === startTree ? currentTree : null;
+        const artifact = join("artifacts", `${id}.md`);
+        try {
+          mkdirSync(join(policy.runDir, "artifacts"), { recursive: true });
+          writeFileSync(join(policy.runDir, artifact), params.message, "utf8");
+        } catch (error) { fileError(error); }
+        try {
+          appendFileSync(join(policy.runDir, "events.jsonl"), JSON.stringify(reportEvent({
+            id, worker: policy.name, role: policy.role, kind: params.kind, verdict, tree, artifact,
+          })) + "\n", "utf8");
+        } catch (error) { fileError(error); }
+      }
+      const metadata = [id ? `r:${id}` : "", verdict ? `verdict:${verdict}` : ""].filter(Boolean);
+      const text = `${params.kind} ${policy.name}${metadata.length ? ` [${metadata.join(" ")}]` : ""}: ${params.message}`;
+      let result = "sent to " + orch;
+      for (let attempt = 0; ; attempt++) {
+        signal?.throwIfAborted();
+        try {
+          await new Promise<void>((resolve, reject) => {
+            execFile(`${process.env.SWARM_HOME}/herdr`, ["agent", "prompt", orch, text], {
+              cwd: policy.cwd, env: process.env, signal,
+            }, (error, _stdout, stderr) => {
+              if (error) reject(new Error(`swarm_report failed: ${stderr || error.message}`));
+              else resolve();
+            });
+          });
+          break;
+        } catch (error) {
+          signal?.throwIfAborted();
+          if (!String(error).includes("agent_blocked")) throw error;
+          if (attempt < 12) {
+            await delay(5000, undefined, { signal });
+            continue;
+          }
+          if (!policy.runDir) throw error;
+          try {
+            appendFileSync(join(policy.runDir, "events.jsonl"), JSON.stringify({ t: "undelivered", ts: Date.now(), id }) + "\n", "utf8");
+          } catch (recordError) { fileError(recordError); }
+          result = `orchestrator is busy with a user dialog; your report is recorded in the run log (artifact r:${id}). Tell the orchestrator via your final answer if needed`;
+          break;
+        }
+      }
       return {
-        content: [{ type: "text", text: "sent to " + orch }],
+        content: [{ type: "text", text: [result, ...warnings].join("\n") }],
         details: undefined,
         terminate: params.kind === "DONE",
       };

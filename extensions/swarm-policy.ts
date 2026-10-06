@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as os from "node:os";
+import { statSync } from "node:fs";
 
 export type Decision = { action: "allow" } | { action: "block"; reason: string } | { action: "confirm"; title: string; reason: string };
 export interface Policy {
@@ -13,12 +14,22 @@ export interface Policy {
   homeDir?: string;
   testPathRe: RegExp;
   writeScope: string[];
+  runDir?: string;
+  home?: string;
+  protectedDirs: string[];
+  allowTools: string[];
+  publishCheck?: () => { ok: boolean; why: string };
+  toolInfo?: (name: string) => { readOnly?: boolean } | undefined;
   currentBranch?: () => string | undefined;
 }
 
 const DEFAULT_TEST_RE = "(^|/)(tests?|specs?|__tests__|__mocks__|testdata|fixtures|e2e)/|[._-](test|spec)s?\\.[^/]+$|(^|/)test_[^/]+\\.py$|_test\\.go$|(^|/)conftest\\.py$|Tests?\\.(swift|kt|java|cs|php)$";
 export function parsePolicy(env: Record<string, string | undefined>, cwd: string): Policy | undefined {
   if (!env.SWARM_ROLE) return undefined;
+  cwd = path.resolve(cwd);
+  const homeDir = env.HOME || os.homedir();
+  const runDir = env.SWARM_RUN_DIR ? path.resolve(cwd, env.SWARM_RUN_DIR) : undefined;
+  const home = env.SWARM_HOME ? path.resolve(cwd, env.SWARM_HOME) : undefined;
   return {
     role: env.SWARM_ROLE,
     caps: new Set((env.SWARM_CAPS ?? "").split(",").map(x => x.trim()).filter(x => x && x !== "none")),
@@ -27,7 +38,12 @@ export function parsePolicy(env: Record<string, string | undefined>, cwd: string
     cwd: path.resolve(cwd),
     tmpDirs: [...new Set([os.tmpdir(), "/tmp", "/private/tmp", env.TMPDIR].filter((x): x is string => !!x).map(x => path.resolve(x)))],
     tmpDir: env.TMPDIR,
-    homeDir: env.HOME || os.homedir(),
+    homeDir,
+    runDir,
+    home,
+    protectedDirs: [...new Set([home, runDir, path.join(homeDir, ".pi/agent")]
+      .filter((dir): dir is string => !!dir && !inside(cwd, dir)))],
+    allowTools: (env.SWARM_ALLOW_TOOLS ?? "").split(",").map(x => x.trim()).filter(Boolean),
     testPathRe: new RegExp(env.SWARM_TEST_PATH_RE || DEFAULT_TEST_RE),
     writeScope: (env.SWARM_WRITE_SCOPE ?? "").split(",").map(x => x.trim()).filter(Boolean),
   };
@@ -218,8 +234,20 @@ function testFile(file: string, p: Policy): boolean {
   p.testPathRe.lastIndex = 0;
   return p.testPathRe.test(path.relative(p.cwd, path.resolve(p.cwd, file)).split(path.sep).join("/"));
 }
+function protectedPath(file: string, p: Policy): boolean {
+  if (/\$(?:SWARM_(?:RUN_DIR|HOME)\b|\{SWARM_(?:RUN_DIR|HOME)\})/.test(file)) return true;
+  const expanded = file.replace(/^(?:\$TMPDIR|\$\{TMPDIR\})(?=\/|$)/, p.tmpDir ?? "$TMPDIR")
+    .replace(/^~(?=\/|$)/, p.homeDir ?? os.homedir());
+  return p.protectedDirs.some(dir => inside(path.resolve(p.cwd, expanded), dir));
+}
+function protectedBlock(): Decision {
+  return block("swarm run state/config is protected; report through swarm_report", "orchestrator", "handle run state/config through swarm_report");
+}
 function scoped(file: string, p: Policy): boolean {
-  return !p.writeScope.length || p.writeScope.some(scope => scope.endsWith("/")
+  if (temporary(file, p)) return true;
+  if (!p.writeScope.length) return !file.includes("$") && !file.startsWith("~") && inside(path.resolve(p.cwd, file), p.cwd);
+  file = path.resolve(p.cwd, file);
+  return p.writeScope.some(scope => scope.endsWith("/") || statSync(path.resolve(p.cwd, scope), { throwIfNoEntry: false })?.isDirectory()
     ? inside(file, path.resolve(p.cwd, scope)) : file === path.resolve(p.cwd, scope));
 }
 
@@ -281,6 +309,18 @@ function gitWrites(sub: string, args: string[]): boolean {
   }
   return false;
 }
+function pushDanger(args: string[], p: Policy): string | undefined {
+  if (args.some(a => /^--(force(?:-with-lease|-if-includes)?|mirror|delete)(=|$)/.test(a) || /^-[^-]*[fd]/.test(a) || /^[+:]/.test(a))) return "force/delete push changes remote history";
+  if (args.some(a => /^(?:refs\/heads\/)?(?:main|master)$/.test(a) || /:(?:refs\/heads\/)?(?:main|master)$/.test(a))) return "push to main/master";
+  // Options may have operands; do not mistake -u/--set-upstream for a refspec.
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (["--repo", "--receive-pack", "--exec", "--push-option", "-o"].includes(args[i])) { i++; continue; }
+    if (!args[i].startsWith("-")) positional.push(args[i]);
+  }
+  if (positional.slice(1).some(a => /[$`]/.test(a))) return "push target contains a variable/substitution and cannot be checked";
+  if ((positional.length <= 1 || positional.slice(1).some(a => a === "HEAD" || a === "@")) && ["main", "master"].includes(p.currentBranch?.() ?? "")) return "push from main/master";
+}
 function githubDanger(tokens: string[], p: Policy): string | undefined {
   const exe = path.basename(tokens[0] ?? "");
   if (exe === "git") {
@@ -292,17 +332,8 @@ function githubDanger(tokens: string[], p: Policy): string | undefined {
     if (sub === "stash" && ["drop", "clear"].includes(args[0])) return "git stash deletes saved changes";
     if (sub === "branch" && (args.some(a => /^-[^-]*D/.test(a)) || (args.some(a => /^-[^-]*f/.test(a) || a === "--force") && args.some(a => /^(?:main|master)$/.test(a))))) return "git branch deletes or overwrites branches";
     if (sub === "update-ref" && args.includes("-d")) return "git update-ref deletes a reference";
-    if (sub !== "push") return;
-    if (args.some(a => /^--(force(?:-with-lease|-if-includes)?|mirror|delete)(=|$)/.test(a) || /^-[^-]*[fd]/.test(a) || /^[+:]/.test(a))) return "force/delete push changes remote history";
-    if (args.some(a => /^(?:refs\/heads\/)?(?:main|master)$/.test(a) || /:(?:refs\/heads\/)?(?:main|master)$/.test(a))) return "push to main/master";
-    // Options may have operands; do not mistake -u/--set-upstream for a refspec.
-    const positional: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (["--repo", "--receive-pack", "--exec", "--push-option", "-o"].includes(args[i])) { i++; continue; }
-      if (!args[i].startsWith("-")) positional.push(args[i]);
-    }
-    if (positional.slice(1).some(a => /[$`]/.test(a))) return "push target contains a variable/substitution and cannot be checked";
-    if ((positional.length <= 1 || positional.slice(1).some(a => a === "HEAD" || a === "@")) && ["main", "master"].includes(p.currentBranch?.() ?? "")) return "push from main/master";
+    if (sub === "push") return pushDanger(args, p);
+    return;
   }
   if (["curl", "wget"].includes(exe) && tokens.some(a => /(?:^|\/\/)api\.github\.com(?:[/:]|$)/i.test(a))) {
     const args = tokens.slice(1);
@@ -313,7 +344,12 @@ function githubDanger(tokens: string[], p: Policy): string | undefined {
     }
   }
   if (exe !== "gh" && exe !== "hub") return;
-  const args = tokens.slice(1);
+  if (exe === "hub") {
+    const [sub, ...args] = gitArgs(tokens);
+    if (sub === "push") return pushDanger(args, p);
+    if (sub === "merge") return "hub merge merges a pull request";
+  }
+  const args = exe === "hub" ? gitArgs(tokens) : tokens.slice(1);
   // gh global options can precede the command.
   while (args[0]?.startsWith("-")) { const a = args.shift(); if (a === "--repo" || a === "-R" || a === "--hostname") args.shift(); }
   const [group, sub] = args;
@@ -398,15 +434,22 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
   if (p.role === "orchestrator") return toolName.startsWith("swarm_") ? ALLOW : block("orchestrator delegates; use swarm_spawn", "orchestrator", "delegate with swarm_spawn");
   if (toolName === "subagent") return block("only the orchestrator spawns agents; swarm_report HANDOFF", "orchestrator", "spawn the required worker");
   if (toolName === "edit" || toolName === "write") {
-    const file = path.resolve(p.cwd, String(input.path ?? ""));
+    const target = String(input.path ?? "");
+    if (protectedPath(target, p)) return protectedBlock();
+    const file = path.resolve(p.cwd, target);
     if (p.caps.has("edit") || p.caps.has("edit-tests")) {
-      if (!scoped(file, p)) return block("outside your task's files; QUESTION orchestrator", "orchestrator", "clarify the task's file scope");
+      if (!scoped(target, p)) return block("outside your task's files; QUESTION orchestrator", "orchestrator", "clarify the task's file scope");
       if (p.caps.has("edit") || testFile(file, p) || temporary(file, p)) return ALLOW;
       return block("tester edits test files only; HANDOFF impl/debugger for source changes", "impl/debugger", "make the source changes");
     }
     return block(`${p.role} is read-only; HANDOFF impl`, "impl", "edit the project files");
   }
-  if (toolName !== "bash" && toolName !== "powershell") return ALLOW;
+  if (toolName !== "bash" && toolName !== "powershell") {
+    if (["read", "grep", "find", "ls"].includes(toolName) || toolName.startsWith("swarm_")) return ALLOW;
+    if (/github/i.test(toolName)) return p.caps.has("github") ? ALLOW : block(`${p.role} may not use GitHub`, "github", "perform this GitHub operation");
+    if (toolName === "codemode" || !p.caps.size || p.allowTools.includes(toolName) || p.toolInfo?.(toolName)?.readOnly) return ALLOW;
+    return block(`${p.role} may not use unclassified tool ${toolName}`, "orchestrator", "delegate or explicitly allow this tool");
+  }
   let segments: CommandSegment[];
   try { segments = splitCommands(String(input.command ?? "")); }
   catch { return block("command too complex for the guard; split it", "orchestrator", "split the command into guardable steps"); }
@@ -428,12 +471,14 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
     const t = unwrap(segment.tokens);
     const exe = path.basename(t[0] ?? ""), args = t.slice(1);
     if (segment.piped && ["bash", "sh", "zsh", "fish"].includes(exe) && !p.caps.has("github")) return block("piping into a shell cannot be checked", "orchestrator", "delegate this script to the appropriate worker");
-    if (!p.caps.has("edit")) {
-      for (const target of segment.redirects) {
-        const variable = target.match(/^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$/);
-        const tempVariable = variable && tempVariables.has(variable[1] ?? variable[2]);
-        if (!["/dev/null", "/dev/stdout", "/dev/stderr"].includes(target) && !temporary(target, p) && !tempVariable) return block(`${p.role} may not redirect output to project files`, "impl", "write that file");
-      }
+    for (const target of segment.redirects) {
+      if (protectedPath(target, p)) return protectedBlock();
+      const variable = target.match(/^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$/);
+      const tempVariable = variable && tempVariables.has(variable[1] ?? variable[2]);
+      const device = ["/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"].includes(target) || /^\/dev\/fd\/[^/]+$/.test(target);
+      if (device || tempVariable) continue;
+      if ((p.caps.has("edit") || p.caps.has("edit-tests")) && !scoped(target, p)) return block("outside your task's files; QUESTION orchestrator", "orchestrator", "clarify the task's file scope");
+      if (!p.caps.has("edit") && !temporary(target, p)) return block(`${p.role} may not redirect output to project files`, "impl", "write that file");
     }
     if (["bash", "sh", "zsh", "fish"].includes(exe) && args.some(a => /^-[^-]*c/.test(a))) {
       const index = args.findIndex(a => /^-[^-]*c/.test(a));
@@ -446,8 +491,23 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
       if (d.action === "block") return d;
       if (d.action === "confirm") approval = d;
     }
+    if (/^(?:node|python[\d.]*|ruby|perl|deno|bun)$/.test(exe)) {
+      const code: string[] = [];
+      for (let i = 0; i < args.length; i++) {
+        if (["eval", "--eval", "--print", "--command", "-e", "-c", "-p"].includes(args[i]) || /^-[^-]*[ecp]$/.test(args[i])) code.push(args[i + 1] ?? "");
+        else if (/^(?:--(?:eval|print|command)=|-[ecp].+)/.test(args[i])) code.push(args[i].replace(/^(?:--[^=]+=|-[ecp])/, ""));
+      }
+      if (code.some(text => /\bSWARM_(?:RUN_DIR|HOME)\b/.test(text) || p.protectedDirs.some(dir => {
+        if (text.includes(dir)) return true;
+        if (!p.homeDir || !inside(dir, p.homeDir)) return false;
+        const rel = path.relative(p.homeDir, dir).split(path.sep).join("/");
+        return [`~/${rel}`, `$HOME/${rel}`, `\${HOME}/${rel}`].some(literal => text.includes(literal));
+      }))) return protectedBlock();
+      if (code.some(text => /api\.github\.com|\bgh\s|\bgit\s+(?:[^\s]+\s+)*(?:push|pull|fetch|clone|add|commit|checkout|switch|restore|reset|stash|rebase|merge|cherry-pick|revert|clean|am|apply|mv|rm|init|worktree|bisect|notes|update-ref|replace|symbolic-ref|update-index|submodule|tag|config|branch|remote)\b/i.test(text))) return block("run git directly instead of through an interpreter", "github", "run the GitHub/git operation directly");
+    }
     if (exe === "swarm") return block("only the orchestrator controls swarm agents", "orchestrator", "perform agent control");
     if (exe === "herdr" && !(args[0] === "agent" && args[1] === "prompt" && [p.orchestrator, "$SWARM_ORCHESTRATOR", "${SWARM_ORCHESTRATOR}"].includes(args[2]))) return block("workers may only prompt their orchestrator with herdr", "orchestrator", "perform agent/pane control");
+    if (exe === "herdr" && !/^(DONE|QUESTION|HANDOFF) /.test(args[3] ?? "")) return block("orchestrator prompts must be DONE, QUESTION or HANDOFF reports", "orchestrator", "receive the report through swarm_report");
     if (exe === "pi" && !(args.length && args.every(a => ["--version", "--help", "--list-models"].includes(a)))) return block("only the orchestrator spawns agents", "orchestrator", "spawn the required worker");
     let github = exe === "gh" || exe === "hub" || (["curl", "wget"].includes(exe) && args.some(a => /(?:^|\/\/)api\.github\.com(?:[/:]|$)/i.test(a)));
     if (exe === "git") {
@@ -457,11 +517,23 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
     }
     if (github && !p.caps.has("github")) return block(`${p.role} may not use GitHub`, "github", "perform this GitHub operation");
     if (p.caps.has("github")) {
+      const ghArgs = [...args];
+      while (ghArgs[0]?.startsWith("-")) { const option = ghArgs.shift(); if (["--repo", "-R", "--hostname"].includes(option!)) ghArgs.shift(); }
+      const publishing = (exe === "git" && gitArgs(t)[0] === "push") || (exe === "hub" && ["push", "pull-request"].includes(gitArgs(t)[0])) || (exe === "gh" && ghArgs[0] === "pr" && ["create", "ready", "merge"].includes(ghArgs[1]));
+      const review = publishing ? p.publishCheck?.() : undefined;
       const danger = githubDanger(t, p);
-      if (danger) approval = confirm(danger + "; only the USER may approve this action");
+      const reasons: string[] = [];
+      if (danger) reasons.push(danger + "; only the USER may approve this action");
+      if (review && !review.ok) reasons.push(`unreviewed or stale review: ${review.why}`);
+      if (reasons.length) approval = confirm(reasons.join("; "));
+    }
+    const mutating = MUTATING.has(exe) || (exe === "sed" && args.some(a => /^-[^-]*i|^--in-place/.test(a))) || (exe === "perl" && args.some(a => /^-[lpnaswtTuUWX0-9]*i/.test(a)));
+    if (mutating) {
+      const targets = mutationPaths(exe, args);
+      if (targets.some(file => protectedPath(file, p))) return protectedBlock();
+      if ((p.caps.has("edit") || p.caps.has("edit-tests")) && targets.some(file => !scoped(file, p))) return block("outside your task's files; QUESTION orchestrator", "orchestrator", "clarify the task's file scope");
     }
     if (!p.caps.has("edit")) {
-      const mutating = MUTATING.has(exe) || (exe === "sed" && args.some(a => /^-[^-]*i|^--in-place/.test(a))) || (exe === "perl" && args.some(a => /^-[lpnaswtTuUWX0-9]*i/.test(a)));
       if (packageMutation(exe, args)) {
         const destinations = packageDestinations(exe, args);
         if (!destinations.length || !destinations.every(file => file && temporary(file, p))) return block(`${p.role} may not install/change packages`, "impl", "change dependencies");
