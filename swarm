@@ -7,7 +7,7 @@
 #   swarm args <type>                                       inspect the pi flags for an agent type
 #   swarm ls                                                live agents in the current swarm tab
 #   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
-#   swarm wait <name>... [--timeout MS]                     block until each agent settles; print its output
+#   swarm wait <name>... [--timeout MS] [--no-read]         wait for reports; read panes only as fallback
 #   swarm close <name>                                      close a worker's pane
 #
 # Agent types live in agents/<type>.md with a frontmatter block:
@@ -203,7 +203,7 @@ cmd_start() {
     echo; echo "# Swarm context (generated)"; echo
     echo "You are \`$ORCH\`, the orchestrator of the swarm in tab \`$TAB\`, project \`$CWD\`."
     [[ -n "$PREFIX" ]] && echo "Agent names in this swarm are prefixed with \`$PREFIX\` (spawn does this automatically)."
-    echo "Your only tools are swarm_spawn, swarm_prompt, swarm_wait, swarm_read, swarm_ls, swarm_types, swarm_close. You have no shell, file, web or GitHub access — delegate."
+    echo "Your only tools are swarm_plan, swarm_spawn, swarm_prompt, swarm_wait, swarm_read, swarm_ls, swarm_types, swarm_close. You have no shell, file, web or GitHub access — delegate."
     echo; echo "## Agent types you can spawn"; echo
     echo "| type | use for | enforced scope | model (thinking) |"; echo "|---|---|---|---|"
     local t f use_for
@@ -306,7 +306,11 @@ cmd_spawn() {
 SEQ_DIR="${TMPDIR:-/tmp}/swarm-seq"; mkdir -p "$SEQ_DIR"
 seq_file() { echo "$SEQ_DIR/${SWARM_ORCHESTRATOR:-orchestrator}.$1"; }
 agent_seq() { "$H" agent get "$1" 2>/dev/null | jq -r '.result.agent.state_change_seq // 0'; }
-note_prompt() { agent_seq "$1" > "$(seq_file "$1")"; }   # call right BEFORE prompting
+now_ms(){ perl -MTime::HiRes=time -e 'printf "%d", time*1000' 2>/dev/null || echo $(( $(date +%s)*1000 )); }
+note_prompt() { # call right BEFORE prompting
+  agent_seq "$1" > "$(seq_file "$1")"
+  now_ms > "$(seq_file "$1").ts"
+}
 
 # wait_settled <name> <seq0> <timeout_ms>  -> 0 settled, 1 gone, 2 timeout
 wait_settled() {
@@ -324,30 +328,64 @@ wait_settled() {
   done
 }
 
-# swarm wait <name>... [--timeout MS]
+# swarm wait <name>... [--timeout MS] [--no-read]
 cmd_wait() {
-  local TIMEOUT=1800000 names=()
+  local TIMEOUT=1800000 NO_READ=0 names=()
   while [[ $# -gt 0 ]]; do
-    case "$1" in --timeout) TIMEOUT="$2"; shift 2 ;; *) names+=("$1"); shift ;; esac
+    case "$1" in
+      --timeout) TIMEOUT="$2"; shift 2 ;;
+      --no-read) NO_READ=1; shift ;;
+      *) names+=("$1"); shift ;;
+    esac
   done
-  [[ ${#names[@]} -gt 0 ]] || { echo "usage: swarm wait <name>... [--timeout MS]" >&2; exit 2; }
-  local n st rc=0 seq0 f
+  [[ ${#names[@]} -gt 0 ]] || { echo "usage: swarm wait <name>... [--timeout MS] [--no-read]" >&2; exit 2; }
+  local n st rc=0 seq0 f since report artifact size wait_rc
   for n in "${names[@]}"; do
-    f="$(seq_file "$n")"; seq0=0
+    f="$(seq_file "$n")"; seq0=0; since=0
+    [[ -f "$f.ts" ]] && since="$(cat "$f.ts")"
     if [[ -f "$f" ]]; then seq0="$(cat "$f")"; else
       # no prompt recorded through swarm: trust herdr's settled wait
       "$H" agent wait "$n" --until idle --until done --until blocked --timeout "$TIMEOUT" >/dev/null 2>&1 || { echo "=== $n: wait timed out or agent gone" >&2; rc=1; continue; }
       seq0=-9
     fi
-    wait_settled "$n" "$seq0" "$TIMEOUT"; case $? in
+    wait_rc=0
+    wait_settled "$n" "$seq0" "$TIMEOUT" || wait_rc=$?
+    case $wait_rc in
       1) echo "=== $n: agent gone" >&2; rc=1; continue ;;
       2) echo "=== $n: TIMEOUT after ${TIMEOUT}ms (still $("$H" agent get "$n" | jq -r .result.agent.agent_status))" >&2; rc=1; continue ;;
     esac
-    rm -f "$f"
+    rm -f "$f" "$f.ts"
     st="$("$H" agent get "$n" 2>/dev/null | jq -r .result.agent.agent_status)"
     echo "=== $n: $st"
     [[ "$st" == blocked ]] && echo "(blocked: it is showing a question/approval UI — read it and tell the user)"
-    "$H" agent read "$n" --source recent-unwrapped --lines 150 2>/dev/null | grep -v '^\s*$' | grep -v '^─*$' || true
+    report=""
+    if [[ -f "${SWARM_RUN_DIR:-}/events.jsonl" ]]; then
+      report="$(jq -cR --arg w "$n" --argjson since "$since" 'fromjson? | select(type=="object" and .t=="report" and .worker==$w and (.ts//0)>=$since) | select((.id|type)=="string" and (.id|test("^[A-Za-z0-9._-]+$")))' "$SWARM_RUN_DIR/events.jsonl" | tail -n1)"
+    fi
+    if [[ -n "$report" ]]; then
+      jq -r '(.kind // "REPORT") + " " + .worker +
+        ([if .id != null then "r:" + .id else empty end,
+          if .verdict != null then "verdict:" + .verdict else empty end] |
+          if length > 0 then " [" + join(" ") + "]" else "" end) + ":"' <<<"$report"
+      # Never trust the event's artifact path: derive it from the validated id.
+      artifact="$SWARM_RUN_DIR/artifacts/$(jq -r '.id' <<<"$report").md"
+      if [[ -f "$artifact" ]]; then
+        size="$(wc -c < "$artifact" | tr -d '[:space:]')"
+        if (( size <= 8000 )); then
+          cat "$artifact"; echo
+        else
+          printf '(report is %s chars, not inlined) full text: %s — swarm_read {report:"%s"} or context_from:["r:%s"]\n' \
+            "$size" "$artifact" "$(jq -r '.id // empty' <<<"$report")" "$(jq -r '.id // empty' <<<"$report")"
+        fi
+      else
+        echo "(report artifact unavailable: $artifact)"
+      fi
+    else
+      echo "(no report since the prompt)"
+    fi
+    if (( ! NO_READ )) && { [[ -z "$report" ]] || [[ "$st" == blocked ]]; }; then
+      "$H" agent read "$n" --source recent-unwrapped --lines 40 2>/dev/null | grep -v '^\s*$' | grep -v '^─*$' || true
+    fi
   done
   return $rc
 }

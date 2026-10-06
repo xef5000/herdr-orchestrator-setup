@@ -69,6 +69,22 @@ export function latestReport(events: readonly unknown[], worker: string, sinceTs
   return undefined;
 }
 
+/** Required publish roles are additive: the operator baseline plus any roles a run policy amends in. */
+export function publishRoles(env: string | undefined, policyJson: string | undefined): string[] {
+  const roles: string[] = [];
+  const add = (role: string) => {
+    const trimmed = role.trim();
+    if (trimmed && !roles.includes(trimmed)) roles.push(trimmed);
+  };
+  for (const role of (env ?? "reviewer").split(",")) add(role);
+  try {
+    const parsed: unknown = JSON.parse(policyJson ?? "");
+    const required = (parsed as { require?: unknown } | null)?.require;
+    if (Array.isArray(required)) for (const role of required) if (typeof role === "string") add(role);
+  } catch { /* Missing or malformed policy adds no roles. */ }
+  return roles;
+}
+
 export function publishStatus(events: readonly unknown[], requireRoles: string[], currentTree?: string): { ok: boolean; why: string } {
   for (const role of requireRoles) {
     let report: ReportEvent | undefined;

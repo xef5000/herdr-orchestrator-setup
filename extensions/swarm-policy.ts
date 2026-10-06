@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import * as os from "node:os";
+import { statSync } from "node:fs";
 
 export type Decision = { action: "allow" } | { action: "block"; reason: string } | { action: "confirm"; title: string; reason: string };
 export interface Policy {
@@ -246,7 +247,7 @@ function scoped(file: string, p: Policy): boolean {
   if (temporary(file, p)) return true;
   if (!p.writeScope.length) return !file.includes("$") && !file.startsWith("~") && inside(path.resolve(p.cwd, file), p.cwd);
   file = path.resolve(p.cwd, file);
-  return p.writeScope.some(scope => scope.endsWith("/")
+  return p.writeScope.some(scope => scope.endsWith("/") || statSync(path.resolve(p.cwd, scope), { throwIfNoEntry: false })?.isDirectory()
     ? inside(file, path.resolve(p.cwd, scope)) : file === path.resolve(p.cwd, scope));
 }
 
@@ -308,6 +309,18 @@ function gitWrites(sub: string, args: string[]): boolean {
   }
   return false;
 }
+function pushDanger(args: string[], p: Policy): string | undefined {
+  if (args.some(a => /^--(force(?:-with-lease|-if-includes)?|mirror|delete)(=|$)/.test(a) || /^-[^-]*[fd]/.test(a) || /^[+:]/.test(a))) return "force/delete push changes remote history";
+  if (args.some(a => /^(?:refs\/heads\/)?(?:main|master)$/.test(a) || /:(?:refs\/heads\/)?(?:main|master)$/.test(a))) return "push to main/master";
+  // Options may have operands; do not mistake -u/--set-upstream for a refspec.
+  const positional: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (["--repo", "--receive-pack", "--exec", "--push-option", "-o"].includes(args[i])) { i++; continue; }
+    if (!args[i].startsWith("-")) positional.push(args[i]);
+  }
+  if (positional.slice(1).some(a => /[$`]/.test(a))) return "push target contains a variable/substitution and cannot be checked";
+  if ((positional.length <= 1 || positional.slice(1).some(a => a === "HEAD" || a === "@")) && ["main", "master"].includes(p.currentBranch?.() ?? "")) return "push from main/master";
+}
 function githubDanger(tokens: string[], p: Policy): string | undefined {
   const exe = path.basename(tokens[0] ?? "");
   if (exe === "git") {
@@ -319,17 +332,8 @@ function githubDanger(tokens: string[], p: Policy): string | undefined {
     if (sub === "stash" && ["drop", "clear"].includes(args[0])) return "git stash deletes saved changes";
     if (sub === "branch" && (args.some(a => /^-[^-]*D/.test(a)) || (args.some(a => /^-[^-]*f/.test(a) || a === "--force") && args.some(a => /^(?:main|master)$/.test(a))))) return "git branch deletes or overwrites branches";
     if (sub === "update-ref" && args.includes("-d")) return "git update-ref deletes a reference";
-    if (sub !== "push") return;
-    if (args.some(a => /^--(force(?:-with-lease|-if-includes)?|mirror|delete)(=|$)/.test(a) || /^-[^-]*[fd]/.test(a) || /^[+:]/.test(a))) return "force/delete push changes remote history";
-    if (args.some(a => /^(?:refs\/heads\/)?(?:main|master)$/.test(a) || /:(?:refs\/heads\/)?(?:main|master)$/.test(a))) return "push to main/master";
-    // Options may have operands; do not mistake -u/--set-upstream for a refspec.
-    const positional: string[] = [];
-    for (let i = 0; i < args.length; i++) {
-      if (["--repo", "--receive-pack", "--exec", "--push-option", "-o"].includes(args[i])) { i++; continue; }
-      if (!args[i].startsWith("-")) positional.push(args[i]);
-    }
-    if (positional.slice(1).some(a => /[$`]/.test(a))) return "push target contains a variable/substitution and cannot be checked";
-    if ((positional.length <= 1 || positional.slice(1).some(a => a === "HEAD" || a === "@")) && ["main", "master"].includes(p.currentBranch?.() ?? "")) return "push from main/master";
+    if (sub === "push") return pushDanger(args, p);
+    return;
   }
   if (["curl", "wget"].includes(exe) && tokens.some(a => /(?:^|\/\/)api\.github\.com(?:[/:]|$)/i.test(a))) {
     const args = tokens.slice(1);
@@ -340,7 +344,12 @@ function githubDanger(tokens: string[], p: Policy): string | undefined {
     }
   }
   if (exe !== "gh" && exe !== "hub") return;
-  const args = tokens.slice(1);
+  if (exe === "hub") {
+    const [sub, ...args] = gitArgs(tokens);
+    if (sub === "push") return pushDanger(args, p);
+    if (sub === "merge") return "hub merge merges a pull request";
+  }
+  const args = exe === "hub" ? gitArgs(tokens) : tokens.slice(1);
   // gh global options can precede the command.
   while (args[0]?.startsWith("-")) { const a = args.shift(); if (a === "--repo" || a === "-R" || a === "--hostname") args.shift(); }
   const [group, sub] = args;
@@ -488,7 +497,12 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
         if (["eval", "--eval", "--print", "--command", "-e", "-c", "-p"].includes(args[i]) || /^-[^-]*[ecp]$/.test(args[i])) code.push(args[i + 1] ?? "");
         else if (/^(?:--(?:eval|print|command)=|-[ecp].+)/.test(args[i])) code.push(args[i].replace(/^(?:--[^=]+=|-[ecp])/, ""));
       }
-      if (code.some(text => /\bSWARM_(?:RUN_DIR|HOME)\b/.test(text) || p.protectedDirs.some(dir => text.includes(dir)))) return protectedBlock();
+      if (code.some(text => /\bSWARM_(?:RUN_DIR|HOME)\b/.test(text) || p.protectedDirs.some(dir => {
+        if (text.includes(dir)) return true;
+        if (!p.homeDir || !inside(dir, p.homeDir)) return false;
+        const rel = path.relative(p.homeDir, dir).split(path.sep).join("/");
+        return [`~/${rel}`, `$HOME/${rel}`, `\${HOME}/${rel}`].some(literal => text.includes(literal));
+      }))) return protectedBlock();
       if (code.some(text => /api\.github\.com|\bgh\s|\bgit\s+(?:[^\s]+\s+)*(?:push|pull|fetch|clone|add|commit|checkout|switch|restore|reset|stash|rebase|merge|cherry-pick|revert|clean|am|apply|mv|rm|init|worktree|bisect|notes|update-ref|replace|symbolic-ref|update-index|submodule|tag|config|branch|remote)\b/i.test(text))) return block("run git directly instead of through an interpreter", "github", "run the GitHub/git operation directly");
     }
     if (exe === "swarm") return block("only the orchestrator controls swarm agents", "orchestrator", "perform agent control");
@@ -505,7 +519,7 @@ export function decide(toolName: string, input: Record<string, unknown>, p: Poli
     if (p.caps.has("github")) {
       const ghArgs = [...args];
       while (ghArgs[0]?.startsWith("-")) { const option = ghArgs.shift(); if (["--repo", "-R", "--hostname"].includes(option!)) ghArgs.shift(); }
-      const publishing = (exe === "git" && gitArgs(t)[0] === "push") || (exe === "gh" && ghArgs[0] === "pr" && ["create", "ready", "merge"].includes(ghArgs[1]));
+      const publishing = (exe === "git" && gitArgs(t)[0] === "push") || (exe === "hub" && ["push", "pull-request"].includes(gitArgs(t)[0])) || (exe === "gh" && ghArgs[0] === "pr" && ["create", "ready", "merge"].includes(ghArgs[1]));
       const review = publishing ? p.publishCheck?.() : undefined;
       const danger = githubDanger(t, p);
       const reasons: string[] = [];

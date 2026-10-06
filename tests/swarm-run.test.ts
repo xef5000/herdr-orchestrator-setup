@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { latestReport, parseEvents, publishStatus, reportEvent, treeFingerprint } from "../extensions/swarm-run.ts";
+import { latestReport, parseEvents, publishRoles, publishStatus, reportEvent, treeFingerprint } from "../extensions/swarm-run.ts";
 
 function repo(t: { after(fn: () => void): void }) {
   const cwd = mkdtempSync(join(tmpdir(), "swarm-run-test-"));
@@ -79,6 +79,20 @@ test("fingerprinting outside Git or on error returns undefined", t => {
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   assert.equal(treeFingerprint(cwd), undefined);
   assert.equal(treeFingerprint(join(cwd, "missing")), undefined);
+});
+
+test("publishRoles unions the env baseline with policy amendments, preserving order and deduping", () => {
+  assert.deepEqual(publishRoles(undefined, undefined), ["reviewer"]);
+  assert.deepEqual(publishRoles("", undefined), []);
+  assert.deepEqual(publishRoles("", '{"require":["tester"]}'), ["tester"]);
+  assert.deepEqual(publishRoles("reviewer,tester", '{"require":["tester","security"]}'), ["reviewer", "tester", "security"]);
+  assert.deepEqual(publishRoles(" reviewer , ,tester", undefined), ["reviewer", "tester"]);
+});
+
+test("publishRoles ignores malformed, missing and non-array policy requires", () => {
+  for (const json of [undefined, "", "not json", "{}", '{"require":"tester"}', '{"require":null}', "[]", "null"]) {
+    assert.deepEqual(publishRoles("reviewer", json), ["reviewer"]);
+  }
 });
 
 test("publish gate uses recorded roles, not worker names or implementation verdicts", () => {

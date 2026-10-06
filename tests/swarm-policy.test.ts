@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parsePolicy, decide, splitCommands, type Policy } from "../extensions/swarm-policy.ts";
@@ -208,6 +210,23 @@ test("write scope uses exact files and directory boundaries", () => {
   for (const file of ["src/b.ts", "library/x.ts", "lib/../src/b.ts", "/other/lib/x.ts"]) assert.equal(decide("edit", { path: file }, p).action, "block");
 });
 
+test("existing directories in write scope need no trailing slash", () => {
+  const cwd = mkdtempSync(path.join(os.tmpdir(), "swarm-scope-"));
+  try {
+    mkdirSync(path.join(cwd, "lib"));
+    // This temporary project must exercise write scope, not the temp-file exemption.
+    const p = { ...impl, cwd, tmpDirs: [], writeScope: ["lib"] };
+    for (const tool of ["edit", "write"]) {
+      assert.equal(decide(tool, { path: "lib/x.ts" }, p).action, "allow");
+      assert.equal(decide(tool, { path: "libx.ts" }, p).action, "block");
+    }
+    command(p, "touch lib/x.ts", "allow");
+    command(p, "touch libx.ts", "block");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("tokenizer preserves quoted arguments and detects shell expansions", () => {
   assert.deepEqual(splitCommands('echo "hello world" > "my file"; ls'), [
     { tokens: ["echo", "hello world"], redirects: ["my file"] }, { tokens: ["ls"], redirects: [] },
@@ -323,6 +342,22 @@ test("publish checks gate only GitHub-capable publishing and retain dangerous-ac
   command({ ...github, currentBranch: () => "feature/x" }, "git push origin feature/x", "allow");
 });
 
+test("hub publishing requires fresh review and dangerous operations always confirm", () => {
+  const stale = { ...github, currentBranch: () => "feature/x", publishCheck: () => ({ ok: false, why: "changed files" }) };
+  const reviewed = { ...stale, publishCheck: () => ({ ok: true, why: "fresh review" }) };
+  for (const cmd of ["hub pull-request", "hub push", "hub -C /project pull-request", "hub -C /project push"]) {
+    const d = command(stale, cmd, "confirm");
+    if (d.action === "confirm") assert.match(d.reason, /unreviewed or stale review: changed files/);
+    command(reviewed, cmd, "allow");
+    command(impl, cmd, "block");
+  }
+  for (const p of [stale, reviewed]) {
+    for (const cmd of ["hub merge https://github.com/o/r/pull/1", "hub push --force", "hub -C /project merge https://github.com/o/r/pull/1", "hub -C /project push --force", "hub pr close 12"]) command(p, cmd, "confirm");
+  }
+  command(reviewed, "hub push origin main", "confirm");
+  command({ ...reviewed, currentBranch: () => "main" }, "hub push", "confirm");
+});
+
 test("non-built-in tools require a capability, read-only metadata or explicit allowlist", () => {
   for (const p of [impl, tester, github, policy("git", "git-write")]) {
     assert.equal(decide("mcp_write", {}, p).action, "block");
@@ -385,6 +420,14 @@ test("inline interpreter code cannot access swarm state or protected config", ()
         const d = command(p, `${prefix}${prefix.endsWith("=") ? "" : " "}'${code}'`, "block");
         if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
       }
+    }
+    for (const cmd of [
+      `node -e "fs.writeFileSync('~/.pi/agent/x','')"`,
+      `python3 -c 'open("$HOME/.pi/agent/x","w")'`,
+      `python3 -c 'open("\${HOME}/.pi/agent/x","w")'`,
+    ]) {
+      const d = command(p, cmd, "block");
+      if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected; report through swarm_report/);
     }
     command(p, "node -e 'console.log(1)'", "allow");
   }

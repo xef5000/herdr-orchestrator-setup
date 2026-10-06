@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { parsePolicy, decide } from "./swarm-policy.ts";
-import { parseEvents, publishStatus, reportEvent, treeFingerprint } from "./swarm-run.ts";
+import { parseEvents, publishRoles, publishStatus, reportEvent, treeFingerprint } from "./swarm-run.ts";
 
 export default function (pi: ExtensionAPI) {
   const policy = parsePolicy(process.env, process.cwd());
@@ -28,7 +28,11 @@ export default function (pi: ExtensionAPI) {
           return { ok: false, why: `Cannot read publish evidence: ${String(error)}` };
         }
       }
-      const roles = (process.env.SWARM_PUBLISH_REQUIRE ?? "reviewer").split(",").map(role => role.trim()).filter(Boolean);
+      // Re-read the policy on every check so amendments apply to subsequent reports.
+      let policyJson: string | undefined;
+      try { policyJson = readFileSync(join(policy.runDir!, "policy.json"), "utf8"); }
+      catch { /* Missing or unreadable policy adds no required roles. */ }
+      const roles = publishRoles(process.env.SWARM_PUBLISH_REQUIRE, policyJson);
       return publishStatus(parseEvents(jsonl), roles, treeFingerprint(policy.cwd));
     };
   }

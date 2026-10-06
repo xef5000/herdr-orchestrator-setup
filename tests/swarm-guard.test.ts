@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { stripTypeScriptTypes } from "node:module";
 import { runInNewContext } from "node:vm";
 import { parsePolicy } from "../extensions/swarm-policy.ts";
-import { parseEvents, publishStatus, reportEvent } from "../extensions/swarm-run.ts";
+import { parseEvents, publishRoles, publishStatus, reportEvent } from "../extensions/swarm-run.ts";
 
 // Evaluate the extension with a minimal API and injected IO: no Pi runtime required.
 const source = stripTypeScriptTypes(readFileSync(new URL("../extensions/swarm-guard.ts", import.meta.url), "utf8"))
@@ -18,7 +18,7 @@ function harness(extra: Record<string, string> = {}) {
   const context: any = {
     process: { env, cwd: () => "/repo" },
     Type: new Proxy({}, { get: () => (...args: unknown[]) => args }),
-    parsePolicy: () => policy, decide: () => ({ action: "allow" }), parseEvents, publishStatus, reportEvent,
+    parsePolicy: () => policy, decide: () => ({ action: "allow" }), parseEvents, publishRoles, publishStatus, reportEvent,
     treeFingerprint: () => state.tree, randomBytes: () => ({ toString: () => "abcdef" }), join: (...parts: string[]) => parts.join("/"),
     execFileSync: () => "feature",
     readFileSync: (path: string) => { if (!files.has(path)) throw Object.assign(new Error("missing"), { code: "ENOENT" }); return files.get(path); },
@@ -106,6 +106,16 @@ test("recording failures are warnings, other prompt failures and aborts throw", 
   const calls = h.state.calls;
   await assert.rejects(h.report({ kind: "QUESTION", message: "help" }, controller.signal), /abort/i);
   assert.equal(h.state.calls, calls);
+});
+
+test("policy amendments add required publish roles on each check", async () => {
+  const h = harness(); h.handlers.before_agent_start();
+  await h.report({ kind: "DONE", message: "reviewed", verdict: "pass" });
+  assert.equal(h.policy.publishCheck!().ok, true);
+  h.files.set("/run/policy.json", JSON.stringify({ require: ["tester"] }));
+  const status = h.policy.publishCheck!();
+  assert.equal(status.ok, false);
+  assert.equal(status.why, "Missing verdict for required role tester");
 });
 
 test("custom publish roles are required and missing start evidence stays invalid", async () => {
