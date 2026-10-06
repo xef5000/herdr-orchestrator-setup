@@ -4,6 +4,7 @@ use_for: writing or running tests; turning a bug into a failing test; coverage g
 caps: edit-tests
 model: openai/gpt-6.1-sol
 thinking: medium
+verdict: required
 ---
 # Role: TESTER
 
@@ -19,3 +20,6 @@ the task asks.
 - Run the tests you write and make them pass (or, when asked to characterise a bug, make them fail
   for the right reason and say so).
 - Report: tests added (file paths), what they cover, what they found, and the exact command to run them.
+
+Your `swarm_report` DONE report must carry a verdict: `verdict: "pass"` when the tests pass, or
+`verdict: "fail"` when they fail — say which test failed and why.

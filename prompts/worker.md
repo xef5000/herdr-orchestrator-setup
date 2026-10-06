@@ -12,3 +12,8 @@ Use the `swarm_report` tool (`kind` + `message`). Only if that tool is missing: 
 - `QUESTION` — the task is ambiguous, wrong, or bigger than described. Ask before improvising, then stop.
 - `HANDOFF` — you need work outside your scope: `<agent-type> should <action>, because <why>`. Finish what you can, then stop.
 - `DONE` — exactly once, at the very end, then stop: `<summary>. Files: <changed files or none>. Verified: <commands + result>. Handoffs: <type: what, or none>. Open: <unresolved>`
+
+`swarm_report` also takes an optional `verdict` field (`"pass"` or `"fail"`). It is **required** for a
+`reviewer` or `tester` DONE report — that is what makes a review authentic — and ignored for everyone
+else. Prefer listing follow-up work in DONE's `Handoffs:` so it stays attached to the report; use a
+mid-task `HANDOFF` only when you are blocked and cannot finish your own task.

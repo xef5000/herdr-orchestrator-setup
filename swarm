@@ -2,8 +2,8 @@
 # swarm — orchestrator-driven agent swarm for herdr + pi
 #
 #   swarm [start] [--cwd DIR] [--prefix P] [--goal "..."]   open a tab with an orchestrator agent
-#   swarm spawn <type> [--name N] [--task "..."] [--wait]   (from inside a swarm) add a worker pane
-#   swarm types                                             list agent types (agents/*.md)
+#   swarm spawn <type> [--name N] [--task "..."] [--scope "a,b"] [--wait]   add a worker pane (from inside a swarm)
+#   swarm types [--json]                                    list agent types (agents/*.md)
 #   swarm args <type>                                       inspect the pi flags for an agent type
 #   swarm ls                                                live agents in the current swarm tab
 #   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
@@ -168,11 +168,32 @@ cmd_start() {
     echo "agent '$ORCH' is already live; close that swarm's tab or pass --prefix <p>" >&2; exit 1
   fi
 
+  # Per-run state directory, shared by the orchestrator and every worker it spawns.
+  local RUN_BASE RUN_DIR
+  RUN_BASE="${SWARM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/herdr-swarm}"
+  RUN_DIR="$RUN_BASE/runs/${PREFIX}${PROJECT}-$(date +%Y%m%d-%H%M%S)-$$"
+  mkdir -p "$RUN_DIR/artifacts"
+  # Prune runs older than 14 days, but keep any whose events.jsonl is still fresh.
+  local d ev
+  for d in "$RUN_BASE/runs"/*/; do
+    [[ -d "$d" ]] || continue
+    d="${d%/}"
+    find "$d" -maxdepth 0 -mtime +14 -print -quit 2>/dev/null | grep -q . || continue
+    ev="$d/events.jsonl"
+    if [[ -e "$ev" ]]; then
+      find "$ev" -maxdepth 0 -mtime +14 -print -quit 2>/dev/null | grep -q . || continue
+    fi
+    rm -rf "$d"
+  done
+
   echo "▶ creating swarm tab in $WS ($CWD)"
-  local T TAB PANE
+  local T TAB PANE publish_env=()
+  [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && publish_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
   T="$("$H" tab create --workspace "$WS" --cwd "$CWD" --label "swarm:${PREFIX}${PROJECT}" --focus \
         --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
         --env "SWARM_ROLE=orchestrator" --env "SWARM_CAPS=none" --env "SWARM_NAME=$ORCH" \
+        --env "SWARM_RUN_DIR=$RUN_DIR" \
+        ${publish_env[@]+"${publish_env[@]}"} \
         --env "PATH=$SWARM_HOME:${PATH}")"
   TAB="$(jq -r .result.tab.tab_id <<<"$T")"; PANE="$(jq -r .result.root_pane.pane_id <<<"$T")"
   "$H" pane rename "$PANE" "$ORCH" >/dev/null
@@ -206,15 +227,15 @@ cmd_start() {
 
 # ==============================================================================
 cmd_spawn() {
-  local TYPE="" NAME="" TASK="" WAIT=0
+  local TYPE="" NAME="" TASK="" SCOPE="" WAIT=0
   [[ $# -gt 0 && "$1" != --* ]] && { TYPE="$1"; shift; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --name) NAME="$2"; shift 2 ;; --task) TASK="$2"; shift 2 ;; --wait) WAIT=1; shift ;;
+      --name) NAME="$2"; shift 2 ;; --task) TASK="$2"; shift 2 ;; --scope) SCOPE="$2"; shift 2 ;; --wait) WAIT=1; shift ;;
       *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
   done
-  [[ -n "$TYPE" ]] || { echo "usage: swarm spawn <type> [--name N] [--task \"...\"] [--wait]" >&2; exit 2; }
+  [[ -n "$TYPE" ]] || { echo "usage: swarm spawn <type> [--name N] [--task \"...\"] [--scope \"a,b\"] [--wait]" >&2; exit 2; }
   require_type "$TYPE"
   [[ "$TYPE" != "orchestrator" ]] || { echo "use 'swarm start' for an orchestrator" >&2; exit 1; }
   [[ -n "${HERDR_TAB_ID:-}" ]] || { echo "swarm spawn must run from inside a herdr pane (the orchestrator's)" >&2; exit 1; }
@@ -230,10 +251,17 @@ cmd_spawn() {
   if (( w > h * 2 )); then dir=right; else dir=down; fi
   (( w < 70 && h < 18 )) && echo "  (warning: panes are getting small — consider 'swarm close' on finished agents)" >&2
 
-  local PANE caps test_paths extra_env=()
+  local PANE caps test_paths verdict allow_tools extra_env=()
   caps="$(norm_list "$(fm "$(type_file "$TYPE")" caps)")"
   test_paths="$(fm "$(type_file "$TYPE")" test_paths)"
+  verdict="$(fm "$(type_file "$TYPE")" verdict)"
+  allow_tools="$(norm_list "$(fm "$(type_file "$TYPE")" allow_tools)")"
   [[ -n "$test_paths" ]] && extra_env+=(--env "SWARM_TEST_PATH_RE=$test_paths")
+  [[ -n "${SWARM_RUN_DIR:-}" ]] && extra_env+=(--env "SWARM_RUN_DIR=$SWARM_RUN_DIR")
+  [[ -n "$SCOPE" ]] && extra_env+=(--env "SWARM_WRITE_SCOPE=$SCOPE")
+  [[ "$verdict" == required ]] && extra_env+=(--env "SWARM_VERDICT=required")
+  [[ -n "$allow_tools" ]] && extra_env+=(--env "SWARM_ALLOW_TOOLS=$allow_tools")
+  [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && extra_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
   PANE="$("$H" pane split --pane "$target" --direction "$dir" --ratio 0.5 --cwd "$PWD" --no-focus \
           --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
           --env "SWARM_ROLE=$TYPE" --env "SWARM_CAPS=${caps:-none}" \
@@ -257,6 +285,7 @@ cmd_spawn() {
       echo "- GitHub (gh, push/pull/fetch, GitHub API): yes"
     else echo "- GitHub (gh, push/pull/fetch, GitHub API): no -> hand off to github"; fi
     echo "- spawning/messaging other agents: no — only the orchestrator"
+    [[ "$verdict" == required ]] && echo "- your DONE report must set verdict: pass|fail"
   } > "$ctx"
 
   start_pi "$TYPE" "$NAME" "$PANE" "$ctx"
@@ -352,6 +381,21 @@ cmd_args() {
 }
 
 cmd_types() {
+  if [[ "${1:-}" == "--json" ]]; then
+    local t f caps verdict
+    for t in $(list_types); do
+      [[ "$t" == "orchestrator" ]] && continue
+      f="$(type_file "$t")"
+      caps="$(norm_list "$(fm "$f" caps)")"; verdict="$(fm "$f" verdict)"
+      jq -n --arg type "$t" --arg description "$(fm "$f" description)" \
+            --arg use_for "$(fm "$f" use_for)" --arg caps "$caps" --arg verdict "$verdict" \
+            --arg model "$(fm "$f" model)" --arg thinking "$(fm "$f" thinking)" \
+            '{type:$type, description:$description, use_for:$use_for,
+              caps:($caps | split(",") | map(select(. != ""))),
+              verdict:($verdict == "required"), model:$model, thinking:$thinking}'
+    done | jq -s '.'
+    return 0
+  fi
   printf "%-14s %-44s %s\n" TYPE MODEL DESCRIPTION
   local t f
   for t in $(list_types); do
@@ -380,7 +424,7 @@ sub="${1:-start}"; [[ $# -gt 0 ]] && shift || true
 case "$sub" in
   start)  cmd_start "$@" ;;
   spawn)  cmd_spawn "$@" ;;
-  types)  cmd_types ;;
+  types)  cmd_types "$@" ;;
   args)   cmd_args "$@" ;;
   ls)     cmd_ls ;;
   wait)   cmd_wait "$@" ;;

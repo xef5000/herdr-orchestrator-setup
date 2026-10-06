@@ -75,6 +75,80 @@ access via MCP/codemode tools.
 
 ---
 
+## Invariants & threat model
+
+These hold no matter what the user, the orchestrator or a worker says. They are what makes a "done"
+from the swarm trustworthy.
+
+**Verdicts are authentic.** `pass`/`fail` verdicts come *only* from the `reviewer` and `tester` agents,
+and only through the `verdict` field of `swarm_report`. A verdict counts only on a `DONE` report; a
+`pass`/`fail` attached to a `QUESTION` or `HANDOFF` is not review evidence, and a report without a
+verdict from those two types is not a review. The `verdict: required` frontmatter on those agents makes
+`swarm_report` refuse their `DONE` without one, and `impl*` reports are never accepted as review
+evidence even if named in `SWARM_PUBLISH_REQUIRE`.
+
+**Publish gate.** A `git push` or `gh pr create`/`ready`/`merge` by the `github` role asks the user to
+confirm **only when evidence is missing or stale** — no fresh `reviewer` (or other required role)
+`DONE` with `verdict: "pass"` whose recorded tree fingerprint equals the current working tree. A fresh
+pass goes straight through; dangerous-action confirms (force-push, push to `main`/`master`, …) still
+apply even then. The fingerprint is `git add -A` + `write-tree` over the **working tree**, not the ref
+being pushed: a push of another branch or a partial commit is not distinguished, so the gate is a
+reminder, not a proof. Any file changed after a review makes that review stale; a review's tree is
+`null` if the worker changed the tree during its own turn, which is why a `tester` that writes tests has
+no usable tree and `SWARM_PUBLISH_REQUIRE=reviewer,tester` always asks.
+
+**Protected directories.** Only three paths are protected from every worker, whatever its `caps:` —
+`SWARM_HOME` (this repo), `SWARM_RUN_DIR` (the run's state dir) and `~/.pi/agent` (pi config) — and each
+is dropped if the project directory lies inside it. `edit`/`write` and shell writes to them are blocked
+with a reason telling you to report through `swarm_report` instead. `.git/`, `.github/`, `node_modules/`
+and `.env` are **not** specially protected; they are only covered by the normal write scope and
+capability rules.
+
+**Write scope.** By default a write-capable worker may edit the project working tree and temp
+directories, and nothing else. Narrow it with `SWARM_WRITE_SCOPE` (comma-separated files/directories)
+or `swarm spawn <type> --scope "a,b"`; the orchestrator passes the same scope through its `swarm_spawn`
+`files` parameter. Paths outside the scope are blocked with a reason, not silently ignored.
+
+**MCP tool policy.** Read-only roles (`caps: none`) may call any MCP tool. Roles with `edit`, `git-write`
+or `github` caps may only call non-built-in tools that are explicitly read-only (the `readOnlyHint`
+annotation) or listed in the agent's `allow_tools:` frontmatter (a comma list, passed to the worker as
+`SWARM_ALLOW_TOOLS`). `codemode` is always allowed. Any tool whose name contains `github` needs the
+`github` cap, **even for read-only roles**. A non-annotated extension tool (e.g. a web search) is
+blocked for an edit/git/github role until you list it in `allow_tools:`.
+
+**Orchestrator messages.** A worker's `herdr agent prompt` to the orchestrator must start with `DONE`,
+`QUESTION` or `HANDOFF`. Anything else is rejected, so the orchestrator's inbox stays parseable. If a
+report arrives while the orchestrator is in an approval dialog it is recorded in the run log and
+retried; if it still cannot be delivered it is appended as `undelivered`. Automatic redelivery of
+undelivered reports is **not implemented yet** (planned).
+
+**State directory.** Run state lives under
+`${SWARM_STATE_DIR:-${XDG_STATE_HOME:-~/.local/state}/herdr-swarm}/runs/…` — one directory per run,
+holding `events.jsonl` and `artifacts/` — and runs older than 14 days are pruned when a swarm starts. It
+is state, not project data — never commit it.
+
+**No limits.** There are **no** limits on the number of workers, rounds or spawns. The orchestrator may
+spawn as many workers as a task needs and may replace a worker rather than reuse it.
+
+### Threat model
+
+The guards are a guardrail against **over-eager models**, not a sandbox against **adversaries**. They
+stop an agent that is trying to do the right thing but reaches for the wrong tool; they do not stop an
+agent that is actively trying to escape. Known limits, by design:
+
+- Anything a worker hides inside a script it writes and runs — `npm run`/`make` targets, test/build
+  hooks, a downloaded binary — is opaque to the guard.
+- The shell scanner refuses constructs it cannot parse rather than guessing, but a determined agent can
+  still smuggle work through a file, an environment variable or a subprocess.
+- MCP/codemode servers run outside the shell guard; the MCP tool policy above is a routing rule, not a
+  sandbox.
+- The publish fingerprint covers the whole working tree, not the exact ref being pushed, so it can be
+  fresh-but-partial; it is a reminder, not a proof.
+
+Treat the working tree and the machine as trusted. If they are not, run the swarm in a container or VM.
+
+---
+
 ## Install
 
 ### Prerequisites (all platforms)

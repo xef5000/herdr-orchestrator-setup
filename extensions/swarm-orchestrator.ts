@@ -71,12 +71,14 @@ export default function (pi: ExtensionAPI) {
       type: Type.String({ minLength: 1, description: "Agent type from the agent table or swarm_types." }),
       task: Type.String({ minLength: 1, description: "Self-contained task, including context, files, acceptance and verification." }),
       name: Type.Optional(name),
+      files: Type.Optional(Type.Array(Type.String({ minLength: 1 }), { description: "Write scope paths/dirs for the worker; default project+tmp." })),
       wait: Type.Optional(Type.Boolean()),
       timeout_ms: timeout,
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const args = ["spawn", params.type];
       if (params.name) args.push("--name", params.name);
+      if (params.files?.length) args.push("--scope", params.files.join(","));
       args.push("--task", params.task);
       const spawned = await serializeSpawn(() => run("swarm", args, ctx.cwd, signal));
       const workerName = /^spawned (\S+) \(/m.exec(spawned.stdout)?.[1];
