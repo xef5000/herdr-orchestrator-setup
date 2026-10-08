@@ -232,6 +232,37 @@ git clone https://github.com/xef5000/herdr-swarm ~/.config/herdr/swarm
 
 Also adds a **"Herdr Swarm"** entry to your desktop app launcher.
 
+### Update
+
+For a standard git-clone install:
+
+```sh
+swarm update          # fetch origin/main, fast-forward, then re-run install.sh
+swarm update --check  # show current/new commits and a short changelog; don't apply
+```
+
+`swarm update` fast-forwards the currently checked-out branch to `origin/main`; a branch that is
+only ahead of `origin/main` with local commits is reported as already up to date.
+Checking needs only Git, not a running herdr. `--check` exits **0** when up to date,
+**10** when an update is available, **1** on failure, or **2** for invalid arguments.
+A normal update exits **0** on success/already up to date, **1** on failure, or **2**
+for invalid arguments. Checking fetches remote metadata but leaves HEAD, files and
+installation settings unchanged.
+
+Your configuration means edits to `agents/*.md` and untracked custom agent files.
+Non-overlapping local edits and custom files are kept unchanged; if incoming files
+would overlap them, the update refuses rather than stashing or overwriting them.
+Local commits/diverged branches also require a manual merge. Detached HEADs,
+non-git installs and missing/unreachable `origin` remotes produce an error.
+Per-run state (including `policy.json` in the run directory) is not user configuration
+and is left alone. Restart running swarms after updating to load the new extensions.
+
+`install.sh` is safe to re-run: it refreshes the launcher/integration and adds missing
+shell aliases/keybindings without duplicating them. If installation fails after the
+fast-forward, the update reports that the code was updated and asks you to re-run
+`install.sh`. The manual alternative is `git pull --ff-only origin main` inside
+`~/.config/herdr/swarm`, followed by `./install.sh` (resolve any local conflicts first).
+
 ---
 
 ## Use
@@ -339,8 +370,8 @@ It is context, not a report — don't quote it.
 | guard rules | `extensions/swarm-policy.ts` |
 | orchestration strategy | `agents/orchestrator.md` |
 
-Changes apply to the next agent spawned. Re-running `install.sh` after `git pull` is safe (it also
-cleans up entries from older versions).
+Changes apply to the next agent spawned. Use `swarm update` to update the installation and
+re-run its install steps safely (it also cleans up entries from older versions); see [Update](#update).
 
 ## Troubleshooting
 

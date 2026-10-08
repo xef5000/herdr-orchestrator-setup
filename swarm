@@ -9,6 +9,7 @@
 #   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
 #   swarm wait <name>... [--timeout MS] [--no-read]         wait for reports; read panes only as fallback
 #   swarm close <name>                                      close a worker's pane
+#   swarm update [--check]                                  update the install from origin/main (--check exits 10 if available)
 #
 # Agent types live in agents/<type>.md with a frontmatter block:
 #   ---
@@ -27,6 +28,89 @@ set -euo pipefail
 
 SWARM_HOME="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")" && pwd)"
 AGENTS_DIR="$SWARM_HOME/agents"
+
+# ---- update (no herdr, pi or jq needed to check/fetch) --------------------------
+cmd_update() {
+  local check=0 cur new count
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --check) check=1; shift ;;
+      -h|--help) echo "usage: swarm update [--check]"; echo "--check: report only; exits 10 when an update is available, 0 otherwise."; exit 0 ;;
+      *) echo "unknown update arg: $1" >&2; exit 2 ;;
+    esac
+  done
+  command -v git >/dev/null || { echo "swarm update: git is required" >&2; exit 1; }
+  if [[ "$(git -C "$SWARM_HOME" rev-parse --is-inside-work-tree 2>/dev/null || true)" != true ||
+        -n "$(git -C "$SWARM_HOME" rev-parse --show-prefix 2>/dev/null || true)" ]]; then
+    echo "swarm update: $SWARM_HOME is not a git clone" >&2; exit 1
+  fi
+  git -C "$SWARM_HOME" symbolic-ref -q HEAD >/dev/null || {
+    echo "swarm update: detached HEAD; switch to a branch first" >&2; exit 1;
+  }
+  git -C "$SWARM_HOME" remote get-url origin >/dev/null 2>&1 || {
+    echo "swarm update: no origin remote configured" >&2; exit 1;
+  }
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$SWARM_HOME" fetch --quiet origin main; then
+    echo "swarm update: couldn't reach origin (or origin/main is unavailable)" >&2; exit 1
+  fi
+  cur="$(git -C "$SWARM_HOME" rev-parse --short HEAD)"
+  new="$(git -C "$SWARM_HOME" rev-parse --short FETCH_HEAD)"
+  if [[ "$(git -C "$SWARM_HOME" rev-parse HEAD)" == "$(git -C "$SWARM_HOME" rev-parse FETCH_HEAD)" ]]; then
+    echo "Already up to date ($cur)"; exit 0
+  fi
+  # Nothing new upstream, but the branch is ahead of origin/main: not an error.
+  if git -C "$SWARM_HOME" merge-base --is-ancestor FETCH_HEAD HEAD; then
+    echo "Already up to date ($cur; local commits ahead of origin/main)"; exit 0
+  fi
+  echo "Current $cur -> new $new (origin/main)"
+  echo "Changelog:"
+  git -C "$SWARM_HOME" log --oneline --no-decorate HEAD..FETCH_HEAD | sed -n '1,20p'
+  count="$(git -C "$SWARM_HOME" rev-list --count HEAD..FETCH_HEAD)"
+  if (( count > 20 )); then echo "… and $((count - 20)) more"; fi
+  if ! git -C "$SWARM_HOME" merge-base --is-ancestor HEAD FETCH_HEAD; then
+    echo "swarm update: local commits; merge manually" >&2; exit 1
+  fi
+  (( check )) && exit 10
+  # NUL-delimited paths handle spaces/newlines. Include staged edits and every
+  # untracked file — including ignored ones, which a fast-forward would silently
+  # overwrite. Check directory/file collisions too, not just identical paths.
+  # --no-renames keeps both sides of a staged rename visible. Never stash or reset.
+  local -a dirty=()
+  local dirty_path incoming
+  while IFS= read -r -d '' dirty_path; do dirty+=("$dirty_path"); done < <(
+    git -C "$SWARM_HOME" diff --name-only --no-renames -z HEAD
+    git -C "$SWARM_HOME" ls-files --others -z
+  )
+  while IFS= read -r -d '' incoming; do
+    for dirty_path in ${dirty[@]+"${dirty[@]}"}; do
+      if [[ "$incoming" == "$dirty_path" || "$incoming" == "$dirty_path/"* || "$dirty_path" == "$incoming/"* ]]; then
+        printf 'swarm update: local changes would be overwritten: %s; merge manually\n' "$dirty_path" >&2
+        exit 1
+      fi
+    done
+  done < <(git -C "$SWARM_HOME" diff --name-only --no-renames -z HEAD..FETCH_HEAD)
+  if [[ -n "${SWARM_ORCHESTRATOR:-}" || -n "${SWARM_RUN_DIR:-}" ]]; then
+    echo "Warning: running inside a swarm; restart running swarms after updating." >&2
+  fi
+  # The merge may replace this very script. Execute the entire mutating phase in
+  # a fresh shell so bash never reads more of the old file after it is rewritten.
+  exec bash -c '
+    if ! git -C "$1" merge --ff-only FETCH_HEAD; then
+      echo "swarm update: fast-forward failed; merge manually" >&2; exit 1
+    fi
+    echo "Updated $2 -> $3. Restart running swarms to pick up new extensions."
+    if ! bash "$1/install.sh"; then
+      echo "swarm update: updated, but install.sh failed; re-run it" >&2; exit 1
+    fi
+  ' swarm-update "$SWARM_HOME" "$cur" "$new"
+}
+
+# Dispatch update/help before resolving herdr (or checking other dependencies).
+case "${1:-}" in
+  update) shift; cmd_update "$@" ;;
+  -h|--help|help) sed -n '2,26p' "$0"; exit 0 ;;
+esac
+
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
 
 # ---- herdr binary matching the running server --------------------------------
@@ -468,7 +552,7 @@ case "$sub" in
   wait)   cmd_wait "$@" ;;
   prompt) cmd_prompt "$@" ;;
   close)  cmd_close "$@" ;;
-  -h|--help|help) sed -n '2,25p' "$0" ;;
+  -h|--help|help) sed -n '2,26p' "$0" ;;
   --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
-  *)      echo "unknown command: $sub" >&2; sed -n '2,11p' "$0" >&2; exit 2 ;;
+  *)      echo "unknown command: $sub" >&2; sed -n '2,12p' "$0" >&2; exit 2 ;;
 esac
