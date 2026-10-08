@@ -24,6 +24,23 @@ Add a file, and the orchestrator can spawn it; no other change needed. Agent typ
 swarm starts and cached by the orchestrator, so a type added mid-run is picked up when it is first
 requested (a missing type triggers a refresh).
 
+### Your own agent types
+
+| source | directory |
+|---|---|
+| `project` | `.swarm/agents/` in the swarm's project dir, only with `SWARM_PROJECT_AGENTS=1` |
+| `env` | `$SWARM_AGENTS_DIR` |
+| `xdg` | `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/` |
+| `built-in` | `agents/` |
+
+- The first `<type>.md` found wins, and a same-name file replaces the built-in entirely (no frontmatter merge).
+- `swarm types` shows the source.
+- `orchestrator` always comes from `agents/orchestrator.md`.
+- Names allow only letters, digits, `.`, `_` and `-`.
+- The project folder is opt-in because a repository could otherwise widen `caps:` or replace `reviewer`.
+- The variables are read when you run `swarm` and are passed into the swarm tab.
+- Custom types kept here are never touched by `swarm update`.
+
 | type | what it does | scope (enforced) | default model |
 |---|---|---|---|
 | `orchestrator` | Coordinates. Plans, spawns/closes workers, never edits code. **The only agent that starts, and the one you talk to.** | swarm_plan + swarm_* tools | claude-sonnet-5-5 · medium |
@@ -37,7 +54,8 @@ requested (a missing type triggers a refresh).
 | `researcher` | Read-only answers about libraries, APIs, docs, the codebase. | read-only | claude-sonnet-5-5 · medium |
 
 > Model IDs are the ones available in the author's org. Run `pi --list-models` and edit the
-> frontmatter in `agents/*.md` if yours differ.
+> frontmatter in `agents/*.md` if yours differ, or override the type in
+> `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/`.
 >
 > No `caps:` in the frontmatter means **read-only** — a type only gets write access it asks for.
 
@@ -99,10 +117,15 @@ distinguished, so the gate is a reminder, not a proof. Any file changed after a 
 stale; a `tester` that changes the tree during its turn records `tree=null` — re-run it on the final
 tree to satisfy `require: tester`.
 
-**Protected directories.** Only three paths are protected from every worker, whatever its `caps:` —
-`SWARM_HOME` (this repo), `SWARM_RUN_DIR` (the run's state dir) and `~/.pi/agent` (pi config) — and each
-is dropped if the project directory lies inside it. `edit`/`write` and shell writes to them are blocked
-with a reason telling you to report through `swarm_report` instead. `.git/`, `.github/`, `node_modules/`
+**Protected directories.** These paths are protected from every worker, whatever its `caps:` —
+`SWARM_HOME` (this repo), `SWARM_RUN_DIR` (the run's state dir), `~/.pi/agent` (pi config), the default
+`${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/` folder, `$SWARM_AGENTS_DIR` when set, and the
+project's `.swarm/agents/` when `SWARM_PROJECT_AGENTS=1` — and each is dropped if the project directory
+lies inside it. `edit`/`write` and shell writes to them are blocked with a reason telling you to report
+through `swarm_report` instead. The xdg folder sits outside `SWARM_HOME` and is explicitly guarded, not
+merely left out of the write scope. Protecting the project's `.swarm/agents/` is **best-effort**: like
+every protected path it depends on the heuristic shell scanner, which refuses what it cannot parse but
+can still be bypassed by a determined worker (see the threat model). `.git/`, `.github/`, `node_modules/`
 and `.env` are **not** specially protected; they are only covered by the normal write scope and
 capability rules.
 
@@ -250,6 +273,8 @@ for invalid arguments. Checking fetches remote metadata but leaves HEAD, files a
 installation settings unchanged.
 
 Your configuration means edits to `agents/*.md` and untracked custom agent files.
+Agent types in `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/`, `$SWARM_AGENTS_DIR` or a project's
+`.swarm/agents/` are outside the tracked tree and never updated.
 Non-overlapping local edits and custom files are kept unchanged; if incoming files
 would overlap them, the update refuses rather than stashing or overwriting them.
 Local commits/diverged branches also require a manual merge. Detached HEADs,
@@ -288,7 +313,7 @@ The orchestrator drives these through its `swarm_*` tools; the same commands sti
 inside the swarm tab:
 
 ```sh
-swarm types                                  # list agent types
+swarm types                                  # list agent types and where each is defined
 swarm spawn reviewer --task "..." --wait     # add a worker, send a task, wait for its answer
 swarm prompt reviewer "follow-up" --wait     # message a live worker (and wait)
 swarm wait impl impl-2                       # wait for several workers started without --wait
@@ -363,7 +388,8 @@ It is context, not a report — don't quote it.
 
 | what | where |
 |---|---|
-| add an agent type | create `agents/<type>.md` (copy an existing one) |
+| add an agent type | create `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/<type>.md` (copy one from `agents/`) |
+| override a built-in type without editing the clone | same file name in `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/` or `$SWARM_AGENTS_DIR` |
 | change a model / thinking level | the frontmatter of `agents/<type>.md` |
 | change behaviour | the Markdown body of `agents/<type>.md` |
 | change what an agent may do | `caps:` in `agents/<type>.md` |
