@@ -41,7 +41,10 @@ export function parsePolicy(env: Record<string, string | undefined>, cwd: string
     homeDir,
     runDir,
     home,
-    protectedDirs: [...new Set([home, runDir, path.join(homeDir, ".pi/agent")]
+    protectedDirs: [...new Set([home, runDir, path.join(homeDir, ".pi/agent"),
+      env.SWARM_AGENTS_DIR ? path.resolve(cwd, env.SWARM_AGENTS_DIR) : undefined,
+      env.SWARM_PROJECT_AGENTS === "1" ? path.join(cwd, ".swarm", "agents") : undefined,
+      path.join(env.XDG_CONFIG_HOME || path.join(homeDir, ".config"), "herdr-swarm", "agents")]
       .filter((dir): dir is string => !!dir && !inside(cwd, dir)))],
     allowTools: (env.SWARM_ALLOW_TOOLS ?? "").split(",").map(x => x.trim()).filter(Boolean),
     testPathRe: new RegExp(env.SWARM_TEST_PATH_RE || DEFAULT_TEST_RE),

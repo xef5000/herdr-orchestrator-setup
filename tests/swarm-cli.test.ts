@@ -8,11 +8,22 @@ import { join } from "node:path";
 
 const script = fileURLToPath(new URL("../swarm", import.meta.url));
 
-function swarmTypesJson(): Array<Record<string, unknown>> {
-  const result = spawnSync("bash", [script, "types", "--json"], {
+type SwarmOptions = { cwd?: string; env?: NodeJS.ProcessEnv };
+
+function swarm(args: string[], { cwd, env }: SwarmOptions = {}) {
+  return spawnSync("bash", [script, ...args], {
     encoding: "utf8",
-    env: { ...process.env, HERDR_BIN_PATH: "/bin/true" },
+    cwd,
+    env: {
+      ...process.env, HERDR_BIN_PATH: "/bin/true",
+      XDG_CONFIG_HOME: "/nonexistent/swarm-cli-xdg", SWARM_AGENTS_DIR: "",
+      SWARM_PROJECT_AGENTS: "", SWARM_MODEL: "", SWARM_THINKING: "", ...env,
+    },
   });
+}
+
+function swarmTypesJson(opts?: SwarmOptions): Array<Record<string, unknown>> {
+  const result = swarm(["types", "--json"], opts);
   assert.equal(result.status, 0, result.stderr);
   return JSON.parse(result.stdout);
 }
@@ -25,7 +36,61 @@ test("swarm types --json lists every worker type with caps and verdict", () => {
   assert.deepEqual(byType.get("impl")?.caps, ["edit"]);
   assert.deepEqual(byType.get("planner")?.caps, []);
   assert.deepEqual(byType.get("github")?.caps, ["git-write", "github"]);
-  for (const t of types) assert.equal(typeof t.verdict, "boolean", `${t.type} verdict`);
+  for (const t of types) {
+    assert.equal(typeof t.verdict, "boolean", `${t.type} verdict`);
+    assert.equal(t.source, "built-in", `${t.type} source`);
+  }
+});
+
+test("user agent layers: project > env > xdg > built-in", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "swarm-cli-layers-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const xdg = join(root, "xdg", "herdr-swarm", "agents");
+  const envdir = join(root, "envdir");
+  const project = join(root, "project");
+  const projectAgents = join(project, ".swarm", "agents");
+  for (const dir of [xdg, envdir, projectAgents]) mkdirSync(dir, { recursive: true });
+  const agent = (dir: string, name: string, model: string) => writeFileSync(join(dir, `${name}.md`),
+    `---\ndescription: d\nmodel: ${model}\nthinking: low\ncaps: edit\n---\nbody\n`);
+  agent(xdg, "impl", "xdg/impl");
+  agent(xdg, "custom", "xdg/custom");
+  agent(xdg, "orchestrator", "evil/orch");
+  agent(envdir, "impl", "env/impl");
+  agent(envdir, "reviewer", "env/reviewer");
+  agent(envdir, "bad name", "env/bad");
+  agent(projectAgents, "impl", "project/impl");
+  const env = { XDG_CONFIG_HOME: join(root, "xdg"), SWARM_AGENTS_DIR: envdir, SWARM_PROJECT_AGENTS: "1" };
+  const opts = { cwd: project, env };
+  const types = swarmTypesJson(opts);
+  const byType = new Map(types.map((entry) => [entry.type, entry]));
+  assert.equal(byType.get("impl")?.source, "project");
+  assert.equal(byType.get("impl")?.model, "project/impl");
+  assert.equal(byType.get("reviewer")?.source, "env");
+  assert.equal(byType.get("custom")?.source, "xdg");
+  assert.deepEqual(byType.get("custom")?.caps, ["edit"]);
+  assert.equal(byType.get("planner")?.source, "built-in");
+  assert.ok(types.every((entry) => !String(entry.type).includes(" ")));
+  assert.equal(byType.has("orchestrator"), false);
+  const envOnly = swarmTypesJson({ cwd: project, env: { ...env, SWARM_PROJECT_AGENTS: "" } });
+  assert.equal(envOnly.find((entry) => entry.type === "impl")?.source, "env");
+  const xdgOnly = swarmTypesJson({ cwd: project, env: { ...env, SWARM_PROJECT_AGENTS: "", SWARM_AGENTS_DIR: "" } });
+  assert.equal(xdgOnly.find((entry) => entry.type === "impl")?.source, "xdg");
+  const implArgs = swarm(["args", "impl"], opts);
+  assert.equal(implArgs.status, 0, implArgs.stderr);
+  assert.match(implArgs.stdout, /--model\nproject\/impl\n/);
+  const orchArgs = swarm(["args", "orchestrator"], opts);
+  assert.equal(orchArgs.status, 0, orchArgs.stderr);
+  const orchModel = readFileSync(new URL("../agents/orchestrator.md", import.meta.url), "utf8").match(/^model:\s*(.+)$/m)?.[1];
+  assert.ok(orchModel);
+  assert.ok(orchArgs.stdout.includes(`--model\n${orchModel}\n`));
+  assert.doesNotMatch(orchArgs.stdout, /evil\/orch/);
+  const text = swarm(["types"], opts);
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /^TYPE\s+SOURCE\s+MODEL/m);
+  assert.match(text.stdout, /^impl\s+project\s/m);
+  const invalid = swarm(["args", "../agents/impl"], opts);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /unknown agent type/);
 });
 
 function waitFixture(t: { after: (fn: () => void) => void }, status = "done") {

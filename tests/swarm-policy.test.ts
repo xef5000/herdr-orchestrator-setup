@@ -292,11 +292,44 @@ test("policy resolves state directories, filters project ancestors and parses to
   const p = policy("impl", "edit", { SWARM_RUN_DIR: "../run", SWARM_HOME: "/", HOME: "/project", SWARM_ALLOW_TOOLS: " mcp_write, custom , " });
   assert.equal(p.runDir, "/run");
   assert.equal(p.home, "/");
-  assert.deepEqual(p.protectedDirs, ["/run", "/project/.pi/agent"]);
+  assert.deepEqual(p.protectedDirs, ["/run", "/project/.pi/agent", "/project/.config/herdr-swarm/agents"]);
   assert.deepEqual(p.allowTools, ["mcp_write", "custom"]);
   const inConfig = parsePolicy({ SWARM_ROLE: "impl", SWARM_CAPS: "edit", HOME: "/home/worker" }, "/home/worker/.pi/agent/project")!;
-  assert.deepEqual(inConfig.protectedDirs, []);
+  assert.deepEqual(inConfig.protectedDirs, ["/home/worker/.config/herdr-swarm/agents"]);
   assert.equal(decide("write", { path: "file.ts" }, inConfig).action, "allow");
+});
+
+test("user agent-type directories are protected when enabled", () => {
+  const p = policy("impl", "edit", { SWARM_AGENTS_DIR: "/home/worker/my-agents", SWARM_PROJECT_AGENTS: "1", HOME: "/home/worker" });
+  assert.ok(p.protectedDirs.includes("/home/worker/my-agents"));
+  assert.ok(p.protectedDirs.includes("/project/.swarm/agents"));
+  for (const file of [".swarm/agents/impl.md", "/project/.swarm/agents/reviewer.md", "/home/worker/my-agents/impl.md"]) {
+    for (const tool of ["write", "edit"]) {
+      const d = decide(tool, { path: file }, p);
+      assert.equal(d.action, "block", `${tool} ${file}`);
+      if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected/);
+    }
+  }
+  command(p, "echo x > .swarm/agents/impl.md", "block");
+  command(p, "cp src/a.ts .swarm/agents/impl.md", "block");
+  assert.equal(decide("write", { path: ".swarm/agents/impl.md" }, impl).action, "allow");
+  assert.ok(policy("impl", "edit", { SWARM_AGENTS_DIR: "agents-x" }).protectedDirs.includes("/project/agents-x"));
+});
+
+test("xdg agent-type directory is protected", () => {
+  const p = policy("impl", "edit", { HOME: "/home/worker" });
+  const dir = "/home/worker/.config/herdr-swarm/agents";
+  assert.ok(p.protectedDirs.includes(dir));
+  for (const tool of ["write", "edit"]) {
+    const d = decide(tool, { path: `${dir}/impl.md` }, p);
+    assert.equal(d.action, "block", tool);
+    if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected/);
+  }
+  command(p, `echo x > ${dir}/impl.md`, "block");
+  const xdg = policy("impl", "edit", { HOME: "/home/worker", XDG_CONFIG_HOME: "/custom/xdg" });
+  assert.ok(xdg.protectedDirs.includes("/custom/xdg/herdr-swarm/agents"));
+  assert.equal(decide("write", { path: "/custom/xdg/herdr-swarm/agents/impl.md" }, xdg).action, "block");
+  command(xdg, "echo x > /custom/xdg/herdr-swarm/agents/impl.md", "block");
 });
 
 test("default edit scope is the project and temporary paths, including shell writes", () => {

@@ -3,7 +3,7 @@
 #
 #   swarm [start] [--cwd DIR] [--prefix P] [--goal "..."]   open a tab with an orchestrator agent
 #   swarm spawn <type> [--name N] [--task "..."] [--scope "a,b"] [--wait]   add a worker pane (from inside a swarm)
-#   swarm types [--json]                                    list agent types (agents/*.md)
+#   swarm types [--json]                                    list agent types and where each is defined
 #   swarm args <type>                                       inspect the pi flags for an agent type
 #   swarm ls                                                live agents in the current swarm tab
 #   swarm prompt <name> "<text>" [--wait]                   message a live agent (optionally wait for it)
@@ -11,7 +11,11 @@
 #   swarm close <name>                                      close a worker's pane
 #   swarm update [--check]                                  update the install from origin/main (--check exits 10 if available)
 #
-# Agent types live in agents/<type>.md with a frontmatter block:
+# Agent types are <type>.md files with a frontmatter block; the first match wins:
+#   project   ./.swarm/agents/            (only with SWARM_PROJECT_AGENTS=1)
+#   env       $SWARM_AGENTS_DIR/
+#   xdg       ${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/agents/
+#   built-in  $SWARM_HOME/agents/         (the orchestrator always comes from here)
 #   ---
 #   description: one line
 #   model: provider/model
@@ -108,7 +112,7 @@ cmd_update() {
 # Dispatch update/help before resolving herdr (or checking other dependencies).
 case "${1:-}" in
   update) shift; cmd_update "$@" ;;
-  -h|--help|help) sed -n '2,26p' "$0"; exit 0 ;;
+  -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;;
 esac
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -125,7 +129,26 @@ resolve_herdr() {
 H="$(resolve_herdr)"
 
 # ---- agent type files ----------------------------------------------------------
-type_file() { echo "$AGENTS_DIR/$1.md"; }
+if [[ -n "${SWARM_AGENTS_DIR:-}" && -d "$SWARM_AGENTS_DIR" ]]; then SWARM_AGENTS_DIR="$(cd "$SWARM_AGENTS_DIR" && pwd)"; fi
+PROJECT_DIR="$PWD"   # cmd_start points this at --cwd
+TYPE_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+user_agent_dirs() { # "<source> <dir>" lines, highest precedence first (dirs may not exist)
+  if [[ "${SWARM_PROJECT_AGENTS:-}" == 1 ]]; then echo "project $PROJECT_DIR/.swarm/agents"; fi
+  if [[ -n "${SWARM_AGENTS_DIR:-}" ]]; then echo "env $SWARM_AGENTS_DIR"; fi
+  echo "xdg ${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/agents"
+}
+type_lookup() { # type_lookup <type> -> "<source> <file>"; 1 if undefined. orchestrator is built-in only.
+  local src dir
+  if [[ "$1" != orchestrator ]]; then
+    while read -r src dir; do
+      if [[ -f "$dir/$1.md" ]]; then echo "$src $dir/$1.md"; return 0; fi
+    done < <(user_agent_dirs)
+  fi
+  if [[ -f "$AGENTS_DIR/$1.md" ]]; then echo "built-in $AGENTS_DIR/$1.md"; return 0; fi
+  return 1
+}
+type_file() { local l; l="$(type_lookup "$1")" || l="built-in $AGENTS_DIR/$1.md"; echo "${l#* }"; }
+type_source() { local l; l="$(type_lookup "$1")" || return 0; echo "${l%% *}"; }
 fm() { # fm <file> <key>  -> frontmatter value
   awk -v k="$2" 'NR==1 && $0!="---" {exit} NR>1 && $0=="---" {exit}
                  NR>1 && index($0, k":")==1 {sub(/^[^:]*:[ \t]*/,""); print; exit}' "$1"
@@ -143,9 +166,16 @@ scope_label() {
 body() { # body <file> -> prompt without frontmatter
   awk 'NR==1 && $0!="---" {p=1} p {print; next} NR>1 && $0=="---" {p=1}' "$1"
 }
-list_types() { for f in "$AGENTS_DIR"/*.md; do basename "$f" .md; done; }
+list_types() { # unique valid type names across all layers
+  local src dir f
+  { while read -r src dir; do
+      for f in "$dir"/*.md; do if [[ -f "$f" ]]; then basename "$f" .md; fi; done
+    done < <(user_agent_dirs)
+    for f in "$AGENTS_DIR"/*.md; do if [[ -f "$f" ]]; then basename "$f" .md; fi; done
+  } | { grep -E "$TYPE_RE" || true; } | LC_ALL=C sort -u
+}
 require_type() {
-  [[ -f "$(type_file "$1")" ]] && return 0
+  [[ "$1" =~ $TYPE_RE && -f "$(type_file "$1")" ]] && return 0
   echo "unknown agent type '$1'. Available: $(list_types | grep -v '^orchestrator$' | tr '\n' ' ')" >&2; exit 1
 }
 
@@ -247,6 +277,7 @@ cmd_start() {
     else CWD="$("$H" pane current 2>/dev/null | jq -r '.result.pane.foreground_cwd // .result.pane.cwd // empty')"; CWD="${CWD:-$HOME}"; fi
   fi
   CWD="$(cd "$CWD" && pwd)"
+  PROJECT_DIR="$CWD"
   local PROJECT ORCH; PROJECT="$(basename "$CWD")"; ORCH="${PREFIX}orchestrator"
   if grep -qx "$ORCH" <<<"$(live_names)"; then
     echo "agent '$ORCH' is already live; close that swarm's tab or pass --prefix <p>" >&2; exit 1
@@ -273,6 +304,8 @@ cmd_start() {
   echo "▶ creating swarm tab in $WS ($CWD)"
   local T TAB PANE publish_env=()
   [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && publish_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
+  [[ -n "${SWARM_AGENTS_DIR:-}" ]] && publish_env+=(--env "SWARM_AGENTS_DIR=$SWARM_AGENTS_DIR")
+  [[ -n "${SWARM_PROJECT_AGENTS:-}" ]] && publish_env+=(--env "SWARM_PROJECT_AGENTS=$SWARM_PROJECT_AGENTS")
   T="$("$H" tab create --workspace "$WS" --cwd "$CWD" --label "swarm:${PREFIX}${PROJECT}" --focus \
         --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
         --env "SWARM_ROLE=orchestrator" --env "SWARM_CAPS=none" --env "SWARM_NAME=$ORCH" \
@@ -346,6 +379,8 @@ cmd_spawn() {
   [[ "$verdict" == required ]] && extra_env+=(--env "SWARM_VERDICT=required")
   [[ -n "$allow_tools" ]] && extra_env+=(--env "SWARM_ALLOW_TOOLS=$allow_tools")
   [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && extra_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
+  [[ -n "${SWARM_AGENTS_DIR:-}" ]] && extra_env+=(--env "SWARM_AGENTS_DIR=$SWARM_AGENTS_DIR")
+  [[ -n "${SWARM_PROJECT_AGENTS:-}" ]] && extra_env+=(--env "SWARM_PROJECT_AGENTS=$SWARM_PROJECT_AGENTS")
   PANE="$("$H" pane split --pane "$target" --direction "$dir" --ratio 0.5 --cwd "$PWD" --no-focus \
           --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
           --env "SWARM_ROLE=$TYPE" --env "SWARM_CAPS=${caps:-none}" \
@@ -512,17 +547,18 @@ cmd_types() {
       jq -n --arg type "$t" --arg description "$(fm "$f" description)" \
             --arg use_for "$(fm "$f" use_for)" --arg caps "$caps" --arg verdict "$verdict" \
             --arg model "$(fm "$f" model)" --arg thinking "$(fm "$f" thinking)" \
-            '{type:$type, description:$description, use_for:$use_for,
+            --arg source "$(type_source "$t")" \
+            '{type:$type, source:$source, description:$description, use_for:$use_for,
               caps:($caps | split(",") | map(select(. != ""))),
               verdict:($verdict == "required"), model:$model, thinking:$thinking}'
     done | jq -s '.'
     return 0
   fi
-  printf "%-14s %-44s %s\n" TYPE MODEL DESCRIPTION
+  printf "%-14s %-9s %-44s %s\n" TYPE SOURCE MODEL DESCRIPTION
   local t f
   for t in $(list_types); do
     f="$(type_file "$t")"
-    printf "%-14s %-44s %s\n" "$t" "$(fm "$f" model) ($(fm "$f" thinking))" "$(fm "$f" description)"
+    printf "%-14s %-9s %-44s %s\n" "$t" "$(type_source "$t")" "$(fm "$f" model) ($(fm "$f" thinking))" "$(fm "$f" description)"
   done
 }
 
@@ -552,7 +588,7 @@ case "$sub" in
   wait)   cmd_wait "$@" ;;
   prompt) cmd_prompt "$@" ;;
   close)  cmd_close "$@" ;;
-  -h|--help|help) sed -n '2,26p' "$0" ;;
+  -h|--help|help) sed -n '2,30p' "$0" ;;
   --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
   *)      echo "unknown command: $sub" >&2; sed -n '2,12p' "$0" >&2; exit 2 ;;
 esac
