@@ -44,7 +44,11 @@ export function parsePolicy(env: Record<string, string | undefined>, cwd: string
     protectedDirs: [...new Set([home, runDir, path.join(homeDir, ".pi/agent"),
       env.SWARM_AGENTS_DIR ? path.resolve(cwd, env.SWARM_AGENTS_DIR) : undefined,
       env.SWARM_PROJECT_AGENTS === "1" ? path.join(cwd, ".swarm", "agents") : undefined,
-      path.join(env.XDG_CONFIG_HOME || path.join(homeDir, ".config"), "herdr-swarm", "agents")]
+      path.join(env.XDG_CONFIG_HOME || path.join(homeDir, ".config"), "herdr-swarm", "agents"),
+      env.SWARM_SKILLS_DIR ? path.resolve(cwd, env.SWARM_SKILLS_DIR) : undefined,
+      path.join(env.XDG_CONFIG_HOME || path.join(homeDir, ".config"), "herdr-swarm", "skills"),
+      path.join(homeDir, ".agents", "skills"),
+      path.join(homeDir, ".claude", "skills")]
       .filter((dir): dir is string => !!dir && !inside(cwd, dir)))],
     allowTools: (env.SWARM_ALLOW_TOOLS ?? "").split(",").map(x => x.trim()).filter(Boolean),
     testPathRe: new RegExp(env.SWARM_TEST_PATH_RE || DEFAULT_TEST_RE),
@@ -238,7 +242,7 @@ function testFile(file: string, p: Policy): boolean {
   return p.testPathRe.test(path.relative(p.cwd, path.resolve(p.cwd, file)).split(path.sep).join("/"));
 }
 function protectedPath(file: string, p: Policy): boolean {
-  if (/\$(?:SWARM_(?:RUN_DIR|HOME)\b|\{SWARM_(?:RUN_DIR|HOME)\})/.test(file)) return true;
+  if (/\$\{?SWARM_(?:RUN_DIR|HOME|SKILLS_DIR|SKILL_[A-Z0-9_]+_DIR)\b/.test(file)) return true;
   const expanded = file.replace(/^(?:\$TMPDIR|\$\{TMPDIR\})(?=\/|$)/, p.tmpDir ?? "$TMPDIR")
     .replace(/^~(?=\/|$)/, p.homeDir ?? os.homedir());
   return p.protectedDirs.some(dir => inside(path.resolve(p.cwd, expanded), dir));
