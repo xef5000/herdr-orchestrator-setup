@@ -59,6 +59,52 @@ requested (a missing type triggers a refresh).
 >
 > No `caps:` in the frontmatter means **read-only** — a type only gets write access it asks for.
 
+### Skills an agent type needs
+
+A type can declare the skills its worker needs in the frontmatter:
+
+```yaml
+skills: ada@https://github.com/acme/ada-skill.git#v2.1.0, pdf-tools?
+```
+
+Each comma-separated entry is `name[?][@git-url[#ref]]`. A `?` after the name marks the skill
+**optional**; without it the skill is **required**. `skills: none` (or an empty value) means no
+skills. The list must be on **one line** — the frontmatter parser reads one key per line, so this
+inline form is a deliberate simplification of the YAML list sketched in issue #8. `swarm --help`
+lists the key alongside the other frontmatter keys.
+
+A skill is a directory containing `SKILL.md`. The first match wins, in this order:
+
+| from | directory |
+|---|---|
+| `env` | `$SWARM_SKILLS_DIR/<name>` |
+| `xdg` | `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/skills/<name>` |
+| `agents` | `~/.agents/skills/<name>` |
+| `pi` | `~/.pi/agent/skills/<name>` |
+| `claude` | `~/.claude/skills/<name>` |
+
+For every skill it finds, the worker gets:
+
+- `--skill <dir>` in its pi flags, so the skill shows up in pi's `available_skills` — see `swarm args <type>`.
+- an env var `SWARM_SKILL_<NAME>_DIR` pointing at the directory, e.g. `pdf-tools` → `SWARM_SKILL_PDF_TOOLS_DIR`.
+- a **Skills for your type** section in its generated context prompt.
+
+`swarm spawn` refuses a type whose **required** skill is missing and prints the install line:
+
+```sh
+git clone <source> <dir> && git -C <dir> checkout <ref>
+```
+
+where `<dir>` is `$SWARM_SKILLS_DIR/<name>` (or the xdg directory) and `<ref>` is only used in the
+hint — it is not verified against the checkout. A missing **optional** skill only warns. swarm never
+clones anything by itself; run the printed line (or drop the skill into any lookup dir) and spawn
+again. `swarm types` lists unresolved skills under a `Missing skills:` heading, and
+`swarm types --json` adds per-type `skills` (`name`, `required`, `source`, `ref`, `found`, `path`,
+`from`) and `missing` fields.
+
+`SWARM_SKILLS_DIR` is read when you run `swarm` and is passed into the swarm tab, so workers resolve
+skills from the same place.
+
 ## Scopes & enforcement
 
 Agent scopes are **enforced**, not just prose. The frontmatter of `agents/<type>.md` sets the scope, and the
@@ -74,6 +120,7 @@ Frontmatter keys:
 - `prompt_mode: replace` — use the body as the whole system prompt instead of appending it (orchestrator only).
 - `context_files: off` — start without project context files (orchestrator only).
 - `test_paths:` optional JavaScript test-path regex, overriding the guard's default (tester).
+- `skills:` skills the type needs — see [Skills an agent type needs](#skills-an-agent-type-needs).
 
 What the guard does:
 
@@ -119,12 +166,17 @@ tree to satisfy `require: tester`.
 
 **Protected directories.** These paths are protected from every worker, whatever its `caps:` —
 `SWARM_HOME` (this repo), `SWARM_RUN_DIR` (the run's state dir), `~/.pi/agent` (pi config), the default
-`${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/` folder, `$SWARM_AGENTS_DIR` when set, and the
-project's `.swarm/agents/` when `SWARM_PROJECT_AGENTS=1` — and each is dropped if the project directory
-lies inside it. `edit`/`write` and shell writes to them are blocked with a reason telling you to report
-through `swarm_report` instead. The xdg folder sits outside `SWARM_HOME` and is explicitly guarded, not
-merely left out of the write scope. Protecting the project's `.swarm/agents/` is **best-effort**: like
-every protected path it depends on the heuristic shell scanner, which refuses what it cannot parse but
+`${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/` folder, `$SWARM_AGENTS_DIR` when set, the
+project's `.swarm/agents/` when `SWARM_PROJECT_AGENTS=1`, and the skill directories `$SWARM_SKILLS_DIR`
+when set, `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/skills/`, `~/.agents/skills/` and
+`~/.claude/skills/` (skills under `~/.pi/agent/skills/` are already covered by `~/.pi/agent`) — and
+each is dropped if the project directory lies inside it. `edit`/`write` and shell writes to them are
+blocked with a reason telling you to report through `swarm_report` instead. The xdg folder sits outside
+`SWARM_HOME` and is explicitly guarded, not merely left out of the write scope. Skill directories are
+**readable**: workers can `read`/`grep`/`find`/`ls` them and run their scripts by path, but inline
+`node -e`/`python -c` code that names a protected path literally is refused. Protecting the project's
+`.swarm/agents/` is **best-effort**: like every protected path it depends on the heuristic shell
+scanner, which refuses what it cannot parse but
 can still be bypassed by a determined worker (see the threat model). `.git/`, `.github/`, `node_modules/`
 and `.env` are **not** specially protected; they are only covered by the normal write scope and
 capability rules.
@@ -274,7 +326,8 @@ installation settings unchanged.
 
 Your configuration means edits to `agents/*.md` and untracked custom agent files.
 Agent types in `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/agents/`, `$SWARM_AGENTS_DIR` or a project's
-`.swarm/agents/` are outside the tracked tree and never updated.
+`.swarm/agents/` are outside the tracked tree and never updated, and the same goes for skills in
+`${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/skills/`.
 Non-overlapping local edits and custom files are kept unchanged; if incoming files
 would overlap them, the update refuses rather than stashing or overwriting them.
 Local commits/diverged branches also require a manual merge. Detached HEADs,
@@ -393,6 +446,7 @@ It is context, not a report — don't quote it.
 | change a model / thinking level | the frontmatter of `agents/<type>.md` |
 | change behaviour | the Markdown body of `agents/<type>.md` |
 | change what an agent may do | `caps:` in `agents/<type>.md` |
+| give a type a skill | `skills:` in its frontmatter; install the skill in `${XDG_CONFIG_HOME:-~/.config}/herdr-swarm/skills/<name>/` |
 | guard rules | `extensions/swarm-policy.ts` |
 | orchestration strategy | `agents/orchestrator.md` |
 
@@ -403,6 +457,7 @@ re-run its install steps safely (it also cleans up entries from older versions);
 
 - **`Failed to load extension …swarm-guard.ts`** — pi is too old or the file is missing. Run `swarm args <type>`, then start pi with those exact flags to see the error.
 - **`swarm guard: … blocked`** — working as intended. Edit `caps:` in `agents/<type>.md` if the scope is wrong.
+- **`requires skill 'x', which is not installed`** — run the printed `git clone …` line (or put the skill in any lookup dir) and spawn again.
 - **`agent_pane_busy` / failed to start** — the new pane's shell wasn't ready; `swarm` retries 4×. Slow shell startup? Just retry.
 - **`agent 'orchestrator' is already live`** — close the existing swarm tab or use `--prefix`.
 - **Dock app does nothing** — herdr must be running; see `~/.config/herdr/swarm/launch.log`.

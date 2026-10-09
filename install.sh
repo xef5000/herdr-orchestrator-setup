@@ -127,4 +127,5 @@ cat <<EOF
 
 Agent types, models, scopes: edit $DEST/agents/*.md
 Your own / overriding agent types: ${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/agents/<type>.md
+Skills for your agent types: ${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/skills/<name>/SKILL.md
 EOF

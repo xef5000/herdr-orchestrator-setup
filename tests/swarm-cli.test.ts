@@ -17,6 +17,7 @@ function swarm(args: string[], { cwd, env }: SwarmOptions = {}) {
     env: {
       ...process.env, HERDR_BIN_PATH: "/bin/true",
       XDG_CONFIG_HOME: "/nonexistent/swarm-cli-xdg", SWARM_AGENTS_DIR: "",
+      SWARM_SKILLS_DIR: "", HERDR_TAB_ID: "",
       SWARM_PROJECT_AGENTS: "", SWARM_MODEL: "", SWARM_THINKING: "", ...env,
     },
   });
@@ -39,6 +40,8 @@ test("swarm types --json lists every worker type with caps and verdict", () => {
   for (const t of types) {
     assert.equal(typeof t.verdict, "boolean", `${t.type} verdict`);
     assert.equal(t.source, "built-in", `${t.type} source`);
+    assert.deepEqual(t.skills, [], `${t.type} skills`);
+    assert.deepEqual(t.missing, [], `${t.type} missing`);
   }
 });
 
@@ -91,6 +94,158 @@ test("user agent layers: project > env > xdg > built-in", (t) => {
   const invalid = swarm(["args", "../agents/impl"], opts);
   assert.equal(invalid.status, 1);
   assert.match(invalid.stderr, /unknown agent type/);
+});
+
+test("skills resolve env > xdg > ~/.agents > ~/.pi/agent > ~/.claude", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "swarm-cli-skills-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const xdg = join(root, "xdg");
+  const envskills = join(root, "envskills");
+  const roots = [envskills, join(xdg, "herdr-swarm", "skills"), join(home, ".agents", "skills"),
+    join(home, ".pi", "agent", "skills"), join(home, ".claude", "skills")];
+  for (const dir of [home, xdg, envskills]) mkdirSync(dir, { recursive: true });
+  const skill = (index: number, name: string) => {
+    const dir = join(roots[index], name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "SKILL.md"), "---\nname: n\ndescription: d\n---\n");
+  };
+  for (const [name, indices] of [["a", [0, 1, 2]], ["b", [1, 4]], ["c", [2, 3]],
+    ["d", [3, 4]], ["e", [4]]] as const) {
+    for (const index of indices) skill(index, name);
+  }
+  mkdirSync(join(roots[1], "e"), { recursive: true });
+  const agents = join(xdg, "herdr-swarm", "agents");
+  mkdirSync(agents, { recursive: true });
+  const agent = join(agents, "custom.md");
+  writeFileSync(agent, "---\nskills: a, b, c, d, e, opt?@https://example.com/opt.git, need@https://example.com/need.git#v2.1.0\n---\n");
+  const opts = { env: { HOME: home, XDG_CONFIG_HOME: xdg, SWARM_SKILLS_DIR: envskills } };
+  const custom = swarmTypesJson(opts).find((entry) => entry.type === "custom")!;
+  const skills = custom.skills as Array<Record<string, unknown>>;
+  const labels = ["env", "xdg", "agents", "pi", "claude"];
+  for (const [index, name] of ["a", "b", "c", "d", "e"].entries()) {
+    assert.equal(skills[index].name, name);
+    assert.equal(skills[index].from, labels[index]);
+    assert.equal(skills[index].path, join(roots[index], name));
+    assert.equal(skills[index].found, true);
+  }
+  assert.equal(skills[5].found, false);
+  assert.equal(skills[5].required, false);
+  assert.equal(skills[5].source, "https://example.com/opt.git");
+  assert.equal(skills[6].ref, "v2.1.0");
+  assert.deepEqual(custom.missing, ["need"]);
+  const args = swarm(["args", "custom"], opts);
+  assert.equal(args.status, 0, args.stderr);
+  for (const [index, name] of ["a", "b", "c", "d", "e"].entries()) {
+    assert.ok(args.stdout.includes(`--skill\n${join(roots[index], name)}\n`));
+  }
+  assert.doesNotMatch(args.stdout, /opt|need/);
+  // Install hints default to xdg when no env skill root is selected.
+  const text = swarm(["types"], { env: { HOME: home, XDG_CONFIG_HOME: xdg } });
+  assert.equal(text.status, 0, text.stderr);
+  assert.match(text.stdout, /^TYPE\s+SOURCE\s+MODEL/m);
+  assert.match(text.stdout, /^Missing skills:/m);
+  const target = join(roots[1], "need");
+  assert.ok(text.stdout.includes(`need (required) — install: git clone https://example.com/need.git ${target} && git -C ${target} checkout v2.1.0`));
+  assert.match(text.stdout, /opt \(optional\)/);
+  writeFileSync(agent, "---\nskills: none\n---\n");
+  assert.deepEqual(swarmTypesJson(opts).find((entry) => entry.type === "custom")?.skills, []);
+});
+
+test("swarm spawn fails loudly on a missing required skill", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "swarm-cli-missing-skill-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const xdg = join(root, "xdg");
+  const agents = join(xdg, "herdr-swarm", "agents");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(agents, { recursive: true });
+  writeFileSync(join(agents, "custom.md"), "---\nskills: ada@https://example.com/ada.git#v2.1.0, extra?\n---\n");
+  const opts = { env: { HOME: home, XDG_CONFIG_HOME: xdg, HERDR_TAB_ID: "" } };
+  const missing = swarm(["spawn", "custom"], opts);
+  assert.equal(missing.status, 1);
+  assert.match(missing.stderr, /requires skill 'ada'/);
+  const target = join(xdg, "herdr-swarm", "skills", "ada");
+  assert.ok(missing.stderr.includes(`  install: git clone https://example.com/ada.git ${target} && git -C ${target} checkout v2.1.0\n`));
+  mkdirSync(target, { recursive: true });
+  writeFileSync(join(target, "SKILL.md"), "---\nname: ada\ndescription: d\n---\n");
+  const installed = swarm(["spawn", "custom"], opts);
+  assert.equal(installed.status, 1);
+  assert.match(installed.stderr, /must run from inside a herdr pane/);
+  assert.match(installed.stderr, /optional skill 'extra'/);
+  assert.doesNotMatch(installed.stderr, /requires skill/);
+  writeFileSync(join(agents, "bad.md"), "---\nskills: ../evil\n---\n");
+  const invalid = swarm(["spawn", "bad"], opts);
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /invalid skills entry/);
+});
+
+test("skills with a pipe in their source are invalid", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "swarm-cli-invalid-skill-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const xdg = join(root, "xdg");
+  const agents = join(xdg, "herdr-swarm", "agents");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(agents, { recursive: true });
+  writeFileSync(join(agents, "custom.md"), "---\nskills: a@x|y\n---\n");
+  const opts = { env: { HOME: home, XDG_CONFIG_HOME: xdg, HERDR_TAB_ID: "" } };
+  const custom = swarmTypesJson(opts).find((entry) => entry.type === "custom")!;
+  const skills = custom.skills as Array<Record<string, unknown>>;
+  assert.equal(skills.length, 1);
+  assert.equal(skills[0].error, "invalid");
+  assert.equal(skills[0].found, false);
+  const spawn = swarm(["spawn", "custom"], opts);
+  assert.equal(spawn.status, 1);
+  assert.match(spawn.stderr, /invalid skills entry/);
+});
+
+test("swarm spawn passes resolved skill dirs to the worker", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "swarm-cli-worker-skills-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home");
+  const xdg = join(root, "xdg");
+  const agents = join(xdg, "herdr-swarm", "agents");
+  const skill = join(home, ".agents", "skills", "pdf-tools");
+  mkdirSync(agents, { recursive: true });
+  mkdirSync(skill, { recursive: true });
+  writeFileSync(join(skill, "SKILL.md"), "---\nname: pdf-tools\ndescription: d\n---\n");
+  writeFileSync(join(agents, "custom.md"), "---\nskills: pdf-tools\n---\n");
+  const herdr = join(root, "herdr");
+  const calls = join(root, "calls");
+  writeFileSync(herdr, `#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "$FAKE_CALLS"
+case "$1 $2" in
+  'agent list') echo '{"result":{"agents":[]}}' ;;
+  'pane layout') echo '{"result":{"layout":{"panes":[{"pane_id":"p1","rect":{"width":200,"height":50}}]}}}' ;;
+  'pane split') echo '{"result":{"pane":{"pane_id":"p2"}}}' ;;
+  'pane rename') exit 0 ;;
+  'pane process-info') echo '{"result":{"process_info":{"shell_pid":1,"foreground_processes":[{"pid":1,"name":"bash"}]}}}' ;;
+  'agent start') cat "\${@: -1}" >> "$FAKE_CALLS"; exit 0 ;;
+  *) exit 1 ;;
+esac
+`);
+  chmodSync(herdr, 0o755);
+  const result = swarm(["spawn", "custom", "--name", "w1"], { env: {
+    HOME: home, XDG_CONFIG_HOME: xdg, HERDR_BIN_PATH: herdr, HERDR_TAB_ID: "t1", HERDR_PANE_ID: "p1",
+    TMPDIR: root, SWARM_ORCHESTRATOR: "orch", FAKE_CALLS: calls,
+  } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /spawned w1 \(custom\) in pane p2/);
+  const log = readFileSync(calls, "utf8");
+  assert.ok(log.includes(`--env SWARM_SKILL_PDF_TOOLS_DIR=${skill}`));
+  assert.ok(log.includes(`--skill ${skill}`));
+  assert.match(log, /## Skills for your type/);
+  assert.ok(log.includes("$SWARM_SKILL_PDF_TOOLS_DIR"));
+});
+
+test("swarm help documents skills and ends with env overrides", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "swarm-cli-help-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const result = swarm(["--help"], { env: { HOME: home } });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /skills:/);
+  assert.match(result.stdout.trimEnd().split("\n").at(-1)!, /^# Env overrides/);
 });
 
 function waitFixture(t: { after: (fn: () => void) => void }, status = "done") {

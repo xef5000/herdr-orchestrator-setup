@@ -292,10 +292,10 @@ test("policy resolves state directories, filters project ancestors and parses to
   const p = policy("impl", "edit", { SWARM_RUN_DIR: "../run", SWARM_HOME: "/", HOME: "/project", SWARM_ALLOW_TOOLS: " mcp_write, custom , " });
   assert.equal(p.runDir, "/run");
   assert.equal(p.home, "/");
-  assert.deepEqual(p.protectedDirs, ["/run", "/project/.pi/agent", "/project/.config/herdr-swarm/agents"]);
+  assert.deepEqual(p.protectedDirs, ["/run", "/project/.pi/agent", "/project/.config/herdr-swarm/agents", "/project/.config/herdr-swarm/skills", "/project/.agents/skills", "/project/.claude/skills"]);
   assert.deepEqual(p.allowTools, ["mcp_write", "custom"]);
   const inConfig = parsePolicy({ SWARM_ROLE: "impl", SWARM_CAPS: "edit", HOME: "/home/worker" }, "/home/worker/.pi/agent/project")!;
-  assert.deepEqual(inConfig.protectedDirs, ["/home/worker/.config/herdr-swarm/agents"]);
+  assert.deepEqual(inConfig.protectedDirs, ["/home/worker/.config/herdr-swarm/agents", "/home/worker/.config/herdr-swarm/skills", "/home/worker/.agents/skills", "/home/worker/.claude/skills"]);
   assert.equal(decide("write", { path: "file.ts" }, inConfig).action, "allow");
 });
 
@@ -330,6 +330,39 @@ test("xdg agent-type directory is protected", () => {
   assert.ok(xdg.protectedDirs.includes("/custom/xdg/herdr-swarm/agents"));
   assert.equal(decide("write", { path: "/custom/xdg/herdr-swarm/agents/impl.md" }, xdg).action, "block");
   command(xdg, "echo x > /custom/xdg/herdr-swarm/agents/impl.md", "block");
+});
+
+test("skill directories are protected from writes but readable", () => {
+  const dirs = ["/opt/skills", "/home/worker/.config/herdr-swarm/skills", "/home/worker/.agents/skills", "/home/worker/.claude/skills", "/home/worker/.pi/agent/skills"];
+  for (const [role, caps] of [["impl", "edit"], ["planner", "none"], ["tester", "edit-tests"], ["github", "git-write,github"]]) {
+    const p = policy(role, caps, { HOME: "/home/worker", SWARM_SKILLS_DIR: "/opt/skills" });
+    for (const dir of dirs) {
+      for (const tool of ["write", "edit"]) {
+        const d = decide(tool, { path: `${dir}/ada/SKILL.md` }, p);
+        assert.equal(d.action, "block", `${role} ${tool} ${dir}`);
+        if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected/);
+      }
+      for (const cmd of [`echo x > ${dir}/ada/SKILL.md`, `cp src/a.ts ${dir}/ada/SKILL.md`, `touch ${dir}/ada/x`, `rm -rf ${dir}/ada`]) {
+        const d = command(p, cmd, "block");
+        if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected/);
+      }
+      for (const tool of ["read", "grep", "find", "ls"]) assert.equal(decide(tool, { path: `${dir}/ada/SKILL.md` }, p).action, "allow", `${role} ${tool} ${dir}`);
+      command(p, `cat ${dir}/ada/SKILL.md`, "allow");
+      command(p, `bash ${dir}/ada/scripts/run.sh`, "allow");
+    }
+    command(p, "echo x > $SWARM_SKILL_ADA_DIR/x", "block");
+    command(p, "echo x > ${SWARM_SKILLS_DIR}/x", "block");
+    const d = decide("write", { path: "$SWARM_SKILL_ADA_DIR/SKILL.md" }, { ...p, writeScope: ["./"] });
+    assert.equal(d.action, "block");
+    if (d.action === "block") assert.match(d.reason, /swarm run state\/config is protected/);
+  }
+  const xdg = policy("impl", "edit", { HOME: "/home/worker", XDG_CONFIG_HOME: "/custom/xdg" });
+  assert.ok(xdg.protectedDirs.includes("/custom/xdg/herdr-swarm/skills"));
+  const relative = policy("impl", "edit", { SWARM_SKILLS_DIR: "skills-x" });
+  assert.ok(relative.protectedDirs.includes("/project/skills-x"));
+  const inSkill = parsePolicy({ SWARM_ROLE: "impl", SWARM_CAPS: "edit", HOME: "/home/worker" }, "/home/worker/.agents/skills/ada")!;
+  assert.ok(!inSkill.protectedDirs.includes("/home/worker/.agents/skills"));
+  assert.equal(decide("write", { path: "SKILL.md" }, inSkill).action, "allow");
 });
 
 test("default edit scope is the project and temporary paths, including shell writes", () => {

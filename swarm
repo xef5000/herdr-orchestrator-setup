@@ -26,6 +26,7 @@
 #   prompt_mode: replace (orchestrator only; default: append)
 #   context_files: off (orchestrator only; disables project context files)
 #   test_paths: optional JavaScript test-path regex (tester)
+#   skills: name[?][@git-url[#ref]], ...  skills the type needs; ? = optional (see README)
 #   ---
 # Env overrides: SWARM_MODEL / SWARM_THINKING apply to every agent started.
 set -euo pipefail
@@ -112,7 +113,7 @@ cmd_update() {
 # Dispatch update/help before resolving herdr (or checking other dependencies).
 case "${1:-}" in
   update) shift; cmd_update "$@" ;;
-  -h|--help|help) sed -n '2,30p' "$0"; exit 0 ;;
+  -h|--help|help) sed -n '2,31p' "$0"; exit 0 ;;
 esac
 
 command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -130,6 +131,7 @@ H="$(resolve_herdr)"
 
 # ---- agent type files ----------------------------------------------------------
 if [[ -n "${SWARM_AGENTS_DIR:-}" && -d "$SWARM_AGENTS_DIR" ]]; then SWARM_AGENTS_DIR="$(cd "$SWARM_AGENTS_DIR" && pwd)"; fi
+if [[ -n "${SWARM_SKILLS_DIR:-}" && -d "$SWARM_SKILLS_DIR" ]]; then SWARM_SKILLS_DIR="$(cd "$SWARM_SKILLS_DIR" && pwd)"; fi
 PROJECT_DIR="$PWD"   # cmd_start points this at --cwd
 TYPE_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 user_agent_dirs() { # "<source> <dir>" lines, highest precedence first (dirs may not exist)
@@ -179,6 +181,60 @@ require_type() {
   echo "unknown agent type '$1'. Available: $(list_types | grep -v '^orchestrator$' | tr '\n' ' ')" >&2; exit 1
 }
 
+# ---- skills --------------------------------------------------------------------
+SKILL_RE='^([A-Za-z0-9][A-Za-z0-9._-]*)([?])?(@([^#|[:space:]]+)(#([^|[:space:]]+))?)?$'
+skill_dirs() {
+  if [[ -n "${SWARM_SKILLS_DIR:-}" ]]; then echo "env $SWARM_SKILLS_DIR"; fi
+  echo "xdg ${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/skills"
+  echo "agents $HOME/.agents/skills"
+  echo "pi $HOME/.pi/agent/skills"
+  echo "claude $HOME/.claude/skills"
+  return 0
+}
+skill_install_dir() {
+  printf '%s/%s\n' "${SWARM_SKILLS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-swarm/skills}" "$1"
+  return 0
+}
+skill_env_name() {
+  printf 'SWARM_SKILL_%s_DIR\n' "$(printf '%s' "$1" | tr 'a-z' 'A-Z' | tr -c 'A-Z0-9' '_')"
+  return 0
+}
+skill_hint() {
+  local dir; dir="$(skill_install_dir "$1")"
+  if [[ -n "$2" ]]; then
+    printf 'git clone %q %q' "$2" "$dir"
+    if [[ -n "$3" ]]; then printf ' && git -C %q checkout %q' "$dir" "$3"; fi
+    echo
+  else
+    printf 'put a directory containing SKILL.md at %q\n' "$dir"
+  fi
+  return 0
+}
+skill_status() { # state|name|required|source|ref|dir|from
+  local raw entry name optional src ref req dir from found
+  raw="$(fm "$1" skills)"
+  if [[ -z "$(norm_list "$raw")" ]]; then return 0; fi
+  while IFS= read -r entry; do
+    if [[ -z "$entry" ]]; then continue; fi
+    if [[ "$entry" =~ $SKILL_RE ]]; then
+      name="${BASH_REMATCH[1]}"; optional="${BASH_REMATCH[2]:-}"
+      src="${BASH_REMATCH[4]:-}"; ref="${BASH_REMATCH[6]:-}"
+      req=1; found=0
+      if [[ -n "$optional" ]]; then req=0; fi
+      while read -r from dir; do
+        if [[ -f "$dir/$name/SKILL.md" ]]; then
+          printf 'ok|%s|%s|%s|%s|%s|%s\n' "$name" "$req" "$src" "$ref" "$dir/$name" "$from"
+          found=1; break
+        fi
+      done < <(skill_dirs)
+      if (( ! found )); then printf 'missing|%s|%s|%s|%s||\n' "$name" "$req" "$src" "$ref"; fi
+    else
+      printf 'invalid|%s|1||||\n' "$entry"
+    fi
+  done < <(printf '%s\n' "$raw" | tr ',' '\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  return 0
+}
+
 # ---- helpers -------------------------------------------------------------------
 live_names() { "$H" agent list | jq -r '.result.agents[]?.name // empty'; }
 unique_name() { # unique_name <base>
@@ -224,6 +280,10 @@ build_pi_args() {
     exclude+=",edit,write"
   fi
   PI_ARGS+=(--exclude-tools "$exclude")
+  local sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from
+  while IFS='|' read -r sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from; do
+    if [[ "$sk_state" == ok ]]; then PI_ARGS+=(--skill "$sk_dir"); fi
+  done < <(skill_status "$f")
   if [[ "$type" == orchestrator && "$(fm "$f" context_files)" == off ]]; then
     PI_ARGS+=(--no-context-files)
   fi
@@ -305,6 +365,7 @@ cmd_start() {
   local T TAB PANE publish_env=()
   [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && publish_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
   [[ -n "${SWARM_AGENTS_DIR:-}" ]] && publish_env+=(--env "SWARM_AGENTS_DIR=$SWARM_AGENTS_DIR")
+  [[ -n "${SWARM_SKILLS_DIR:-}" ]] && publish_env+=(--env "SWARM_SKILLS_DIR=$SWARM_SKILLS_DIR")
   [[ -n "${SWARM_PROJECT_AGENTS:-}" ]] && publish_env+=(--env "SWARM_PROJECT_AGENTS=$SWARM_PROJECT_AGENTS")
   T="$("$H" tab create --workspace "$WS" --cwd "$CWD" --label "swarm:${PREFIX}${PROJECT}" --focus \
         --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
@@ -323,11 +384,13 @@ cmd_start() {
     echo "Your only tools are swarm_plan, swarm_spawn, swarm_prompt, swarm_wait, swarm_read, swarm_ls, swarm_types, swarm_close. You have no shell, file, web or GitHub access — delegate."
     echo; echo "## Agent types you can spawn"; echo
     echo "| type | use for | enforced scope | model (thinking) |"; echo "|---|---|---|---|"
-    local t f use_for
+    local t f use_for missing
     for t in $(list_types); do
       [[ "$t" == "orchestrator" ]] && continue
       f="$(type_file "$t")"
       use_for="$(fm "$f" use_for)"; use_for="${use_for:-$(fm "$f" description)}"
+      missing="$(skill_status "$f" | awk -F'|' '$1!="ok" && $3=="1"{print $2}' | paste -s -d, -)"
+      if [[ -n "$missing" ]]; then use_for+=" (unavailable: missing skill $missing)"; fi
       echo "| \`$t\` | $use_for | $(scope_label "$(norm_list "$(fm "$f" caps)")") | $(fm "$f" model) ($(fm "$f" thinking)) |"
     done
   } > "$ctx"
@@ -355,6 +418,32 @@ cmd_spawn() {
   [[ -n "$TYPE" ]] || { echo "usage: swarm spawn <type> [--name N] [--task \"...\"] [--scope \"a,b\"] [--wait]" >&2; exit 2; }
   require_type "$TYPE"
   [[ "$TYPE" != "orchestrator" ]] || { echo "use 'swarm start' for an orchestrator" >&2; exit 1; }
+  local sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from sk_file sk_fail=0 searched=""
+  local skill_env=() skill_context=()
+  sk_file="$(type_file "$TYPE")"
+  while IFS='|' read -r sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from; do
+    case "$sk_state" in
+      ok)
+        skill_env+=(--env "$(skill_env_name "$sk_name")=$sk_dir")
+        skill_context+=("- \`$sk_name\`: \`$sk_dir\` (\$$(skill_env_name "$sk_name"))") ;;
+      missing)
+        if [[ "$sk_req" == 1 ]]; then
+          echo "swarm: agent type '$TYPE' requires skill '$sk_name', which is not installed." >&2
+          echo "  install: $(skill_hint "$sk_name" "$sk_src" "$sk_ref")" >&2
+          sk_fail=1
+        else
+          echo "  (warning: optional skill '$sk_name' for '$TYPE' is not installed; install: $(skill_hint "$sk_name" "$sk_src" "$sk_ref"))" >&2
+        fi ;;
+      invalid)
+        echo "swarm: agent type '$TYPE' has an invalid skills entry '$sk_name' in $sk_file (expected name[?][@git-url[#ref]])" >&2
+        sk_fail=1 ;;
+    esac
+  done < <(skill_status "$sk_file")
+  if (( sk_fail )); then
+    while read -r sk_from sk_dir; do searched+="${searched:+, }$sk_dir"; done < <(skill_dirs)
+    echo "  searched (first <dir>/<name>/SKILL.md wins): $searched" >&2
+    exit 1
+  fi
   [[ -n "${HERDR_TAB_ID:-}" ]] || { echo "swarm spawn must run from inside a herdr pane (the orchestrator's)" >&2; exit 1; }
 
   local PREFIX="${SWARM_PREFIX:-}" ORCH="${SWARM_ORCHESTRATOR:-${SWARM_PREFIX:-}orchestrator}"
@@ -380,11 +469,12 @@ cmd_spawn() {
   [[ -n "$allow_tools" ]] && extra_env+=(--env "SWARM_ALLOW_TOOLS=$allow_tools")
   [[ -n "${SWARM_PUBLISH_REQUIRE:-}" ]] && extra_env+=(--env "SWARM_PUBLISH_REQUIRE=$SWARM_PUBLISH_REQUIRE")
   [[ -n "${SWARM_AGENTS_DIR:-}" ]] && extra_env+=(--env "SWARM_AGENTS_DIR=$SWARM_AGENTS_DIR")
+  [[ -n "${SWARM_SKILLS_DIR:-}" ]] && extra_env+=(--env "SWARM_SKILLS_DIR=$SWARM_SKILLS_DIR")
   [[ -n "${SWARM_PROJECT_AGENTS:-}" ]] && extra_env+=(--env "SWARM_PROJECT_AGENTS=$SWARM_PROJECT_AGENTS")
   PANE="$("$H" pane split --pane "$target" --direction "$dir" --ratio 0.5 --cwd "$PWD" --no-focus \
           --env "SWARM_HOME=$SWARM_HOME" --env "SWARM_PREFIX=$PREFIX" --env "SWARM_ORCHESTRATOR=$ORCH" \
           --env "SWARM_ROLE=$TYPE" --env "SWARM_CAPS=${caps:-none}" \
-          ${extra_env[@]+"${extra_env[@]}"} \
+          ${extra_env[@]+"${extra_env[@]}"} ${skill_env[@]+"${skill_env[@]}"} \
           --env "SWARM_NAME=$NAME" --env "PATH=$SWARM_HOME:${PATH}" | jq -r .result.pane.pane_id)"
   "$H" pane rename "$PANE" "$NAME" >/dev/null
 
@@ -405,6 +495,11 @@ cmd_spawn() {
     else echo "- GitHub (gh, push/pull/fetch, GitHub API): no -> hand off to github"; fi
     echo "- spawning/messaging other agents: no — only the orchestrator"
     [[ "$verdict" == required ]] && echo "- your DONE report must set verdict: pass|fail"
+    if [[ ${#skill_context[@]} -gt 0 ]]; then
+      echo; echo "## Skills for your type"; echo
+      printf '%s\n' ${skill_context[@]+"${skill_context[@]}"}
+      echo "Read each skill's SKILL.md before using it; skill directories are read-only for you."
+    fi
   } > "$ctx"
 
   start_pi "$TYPE" "$NAME" "$PANE" "$ctx"
@@ -539,27 +634,45 @@ cmd_args() {
 
 cmd_types() {
   if [[ "${1:-}" == "--json" ]]; then
-    local t f caps verdict
+    local t f caps verdict skills
     for t in $(list_types); do
       [[ "$t" == "orchestrator" ]] && continue
       f="$(type_file "$t")"
       caps="$(norm_list "$(fm "$f" caps)")"; verdict="$(fm "$f" verdict)"
-      jq -n --arg type "$t" --arg description "$(fm "$f" description)" \
+      skills="$(skill_status "$f" | jq -Rn '[inputs | select(length>0) | split("|") as $p | {name:$p[1], required:($p[2]=="1"), source:(($p[3]//"") | if .=="" then null else . end), ref:(($p[4]//"") | if .=="" then null else . end), found:($p[0]=="ok"), path:(($p[5]//"") | if .=="" then null else . end), from:(($p[6]//"") | if .=="" then null else . end)} + (if $p[0]=="invalid" then {error:"invalid"} else {} end)]')"
+      jq -n --argjson skills "$skills" --arg type "$t" --arg description "$(fm "$f" description)" \
             --arg use_for "$(fm "$f" use_for)" --arg caps "$caps" --arg verdict "$verdict" \
             --arg model "$(fm "$f" model)" --arg thinking "$(fm "$f" thinking)" \
             --arg source "$(type_source "$t")" \
             '{type:$type, source:$source, description:$description, use_for:$use_for,
               caps:($caps | split(",") | map(select(. != ""))),
-              verdict:($verdict == "required"), model:$model, thinking:$thinking}'
+              verdict:($verdict == "required"), model:$model, thinking:$thinking,
+              skills:$skills, missing:($skills | map(select(.required and (.found|not)) | .name))}'
     done | jq -s '.'
     return 0
   fi
   printf "%-14s %-9s %-44s %s\n" TYPE SOURCE MODEL DESCRIPTION
-  local t f
+  local t f sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from requirement
+  local missing_lines=()
   for t in $(list_types); do
     f="$(type_file "$t")"
     printf "%-14s %-9s %-44s %s\n" "$t" "$(type_source "$t")" "$(fm "$f" model) ($(fm "$f" thinking))" "$(fm "$f" description)"
+    while IFS='|' read -r sk_state sk_name sk_req sk_src sk_ref sk_dir sk_from; do
+      case "$sk_state" in
+        missing)
+          requirement=required
+          if [[ "$sk_req" == 0 ]]; then requirement=optional; fi
+          missing_lines+=("  $t: $sk_name ($requirement) — install: $(skill_hint "$sk_name" "$sk_src" "$sk_ref")") ;;
+        invalid)
+          missing_lines+=("  $t: invalid skills entry '$sk_name' (expected name[?][@git-url[#ref]])") ;;
+      esac
+    done < <(skill_status "$f")
   done
+  if [[ ${#missing_lines[@]} -gt 0 ]]; then
+    echo; echo "Missing skills:"
+    printf '%s\n' ${missing_lines[@]+"${missing_lines[@]}"}
+  fi
+  return 0
 }
 
 cmd_ls() {
@@ -588,7 +701,7 @@ case "$sub" in
   wait)   cmd_wait "$@" ;;
   prompt) cmd_prompt "$@" ;;
   close)  cmd_close "$@" ;;
-  -h|--help|help) sed -n '2,30p' "$0" ;;
+  -h|--help|help) sed -n '2,31p' "$0" ;;
   --*)    cmd_start "$sub" "$@" ;;      # `swarm --goal ...` shorthand
   *)      echo "unknown command: $sub" >&2; sed -n '2,12p' "$0" >&2; exit 2 ;;
 esac
